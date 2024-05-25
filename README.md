@@ -20,7 +20,7 @@ The Blue Book Club Website is a one-page scroll-jacking website designed to prom
 - Font Awesome (for icons)
 
 ## Setup
-1. Clone the repository: `git clone https://github.com/your-username/blue-book-club-website.git`
+1. Clone the repository: `git clone https://github.com/aria-vero-s/book-club.git`
 2. Open `index.html` in your web browser to view the website locally.
 
 ## Credits
