@@ -1,0 +1,50 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Books ──────────────────────────────────────────────────────────────────
+    // Anyone can read. Only admins write (managed via Firebase Console).
+    match /books/{bookId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ── Reviews ────────────────────────────────────────────────────────────────
+    // Anyone can read. Authenticated users can create their own.
+    // Only the author can update or delete.
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if request.auth != null
+                    && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if request.auth != null
+                             && resource.data.userId == request.auth.uid;
+    }
+
+    // ── Reading Status ─────────────────────────────────────────────────────────
+    // Anyone can read (used for community stats).
+    // Only the owner can write their own status document.
+    match /readingStatus/{statusId} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.resource.data.userId == request.auth.uid;
+    }
+
+    // ── Votes ──────────────────────────────────────────────────────────────────
+    // Anyone can read (used for live vote counts).
+    // Only the owner can write their own vote document.
+    match /votes/{voteId} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.resource.data.userId == request.auth.uid;
+    }
+
+    // ── Users ──────────────────────────────────────────────────────────────────
+    // Authenticated users can read profiles.
+    // Users can only write their own profile document.
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.auth.uid == userId;
+    }
+  }
+}
