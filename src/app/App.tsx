@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { formatDistanceToNow } from "date-fns";
 import {
   collection,
@@ -12,6 +12,7 @@ import {
   query,
   where,
   serverTimestamp,
+  increment,
   Timestamp,
 } from "firebase/firestore";
 import {
@@ -27,16 +28,21 @@ import {
   Users,
   CheckCheck,
   MessageSquare,
+  Sparkles,
+  ThumbsUp,
+  Bell,
+  MessageCircle,
 } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import { db } from "@/lib/firebase";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { LanguageProvider, useLang } from "@/contexts/LanguageContext";
 
 import imgLanding from "@/imports/1920WLight/61f9d38cef5dfc577b507b3f35af5181e51ce63b.png";
 import imgEthos from "@/imports/1920WLight/e07f166570be5a1cfe58162c1e0f069c18b250d6.png";
 import img1 from "@/imports/1920WLight/02fcd00bcd724eecf83f5f9db77efaa918c241bf.png";
-import img2 from "@/imports/1920WLight/153b6d915790b59ef9cc0702bfd46e0cde1d7524.png";
-import img3 from "@/imports/1920WLight/a815d91c62dcdad861267e6eb3e24fed774b4510.png";
+import imgGirlReading from "@/imports/girl_reading.jpeg";
+import imgSpeechBubble from "@/imports/speech_bubble.jpeg";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -75,9 +81,91 @@ interface Vote {
   bookId: string;
 }
 
+interface Suggestion {
+  id: string;
+  userId: string;
+  userName: string;
+  userPhoto: string;
+  title: string;
+  author: string;
+  coverImage: string;
+  description: string;
+  createdAt: Timestamp | null;
+}
+
+interface Support {
+  id: string;
+  userId: string;
+  suggestionId: string;
+  suggestionOwnerId: string;
+}
+
+interface Reply {
+  id: string;
+  reviewId: string;
+  bookId: string;
+  userId: string;
+  userName: string;
+  userPhoto: string;
+  text: string;
+  createdAt: Timestamp | null;
+}
+
+interface Notification {
+  id: string;
+  recipientId: string;
+  senderId: string;
+  senderName: string;
+  senderPhoto: string;
+  type: "reply";
+  bookId: string;
+  bookTitle: string;
+  reviewId: string;
+  replyText: string;
+  read: boolean;
+  createdAt: Timestamp | null;
+}
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 const MAX_REVIEW = 500;
+const MAX_SUGGESTION_DESC = 200;
+
+// Award tokens to a user — always toast silently, never block UI
+async function awardTokens(uid: string, amount: number, message: string) {
+  try {
+    await updateDoc(doc(db, "users", uid), { tokenBalance: increment(amount) });
+    toast.success(message, { duration: 2500 });
+  } catch { /* silent — never block the primary action */ }
+}
+
+// Subscribe to a user's token balance
+function useTokenBalance(uid?: string) {
+  const [balance, setBalance] = useState(0);
+  useEffect(() => {
+    if (!uid) return;
+    return onSnapshot(doc(db, "users", uid), (snap) => {
+      setBalance(snap.data()?.tokenBalance ?? 0);
+    });
+  }, [uid]);
+  return balance;
+}
+
+function useNotifications(uid?: string) {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  useEffect(() => {
+    if (!uid) return;
+    return onSnapshot(
+      query(collection(db, "notifications"), where("recipientId", "==", uid)),
+      (snap) => {
+        const n = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Notification));
+        n.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+        setNotifications(n);
+      }
+    );
+  }, [uid]);
+  return notifications;
+}
 
 function relativeTime(ts: Timestamp | null): string {
   if (!ts?.toDate) return "";
@@ -146,6 +234,7 @@ function StarRating({
   readonly?: boolean;
   size?: number;
 }) {
+  const { t } = useLang();
   const [hover, setHover] = useState(0);
   const active = hover || value;
 
@@ -218,6 +307,7 @@ function Avatar({
 
 function SignInButton({ large = false }: { large?: boolean }) {
   const { signIn } = useAuth();
+  const { t } = useLang();
   const [loading, setLoading] = useState(false);
 
   return (
@@ -232,7 +322,7 @@ function SignInButton({ large = false }: { large?: boolean }) {
           if (code === "auth/unauthorized-domain") {
             toast.error("This domain is not authorised in Firebase. Add it under Authentication → Settings → Authorised domains.");
           } else {
-            toast.error(`Sign-in failed: ${code || "unknown error"}`);
+            toast.error(t("auth.signIn.error") + (code || "unknown error"));
           }
         } finally {
           setLoading(false);
@@ -250,8 +340,112 @@ function SignInButton({ large = false }: { large?: boolean }) {
         <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="rgba(255,255,255,0.9)" />
         <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="rgba(255,255,255,0.9)" />
       </svg>
-      {loading ? "Signing in…" : "Continue with Google"}
+      {loading ? t("auth.signingIn") : t("auth.continue")}
     </button>
+  );
+}
+
+// ─── Notification Bell ───────────────────────────────────────────────────────
+
+function NotificationBell({ uid }: { uid: string }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const notifications = useNotifications(uid);
+  const unread = notifications.filter((n) => !n.read).length;
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+
+  const markRead = (id: string) =>
+    updateDoc(doc(db, "notifications", id), { read: true });
+
+  const dismiss = (id: string) =>
+    deleteDoc(doc(db, "notifications", id));
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-label="Notifications"
+        aria-expanded={open}
+        className="relative p-2 rounded-full hover:bg-gray-100 text-[#023047]/50 hover:text-[#023047] transition-colors"
+      >
+        <Bell size={18} />
+        {unread > 0 && (
+          <span className="absolute top-0.5 right-0.5 min-w-[16px] h-4 bg-[#219ebc] text-white text-[9px] font-bold rounded-full flex items-center justify-center px-0.5 leading-none">
+            {unread > 9 ? "9+" : unread}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-2 bg-white rounded-2xl shadow-xl border border-gray-100 w-80 overflow-hidden z-50">
+          <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+            <p className="font-['Quando',serif] text-[#023047] text-sm">Notifications</p>
+            {unread > 0 && (
+              <span className="font-['Lato',sans-serif] text-xs text-[#023047]/40">{unread} unread</span>
+            )}
+          </div>
+          {notifications.length === 0 ? (
+            <div className="px-4 py-8 text-center">
+              <p className="font-['Lato',sans-serif] text-[#023047]/35 text-sm">No notifications yet.</p>
+            </div>
+          ) : (
+            <div className="max-h-80 overflow-y-auto divide-y divide-gray-50">
+              {notifications.map((n) => (
+                <div
+                  key={n.id}
+                  className={`px-4 py-3 flex gap-3 items-start transition-colors ${!n.read ? "bg-[#f4fafb]" : "bg-white"}`}
+                >
+                  <Avatar src={n.senderPhoto} name={n.senderName} size={8} />
+                  <div className="flex-1 min-w-0">
+                    <p className="font-['Lato',sans-serif] text-xs text-[#023047]/70 leading-relaxed">
+                      <span className="font-bold text-[#023047]">{n.senderName}</span>
+                      {" replied to your review of "}
+                      <span className="font-bold text-[#023047]">{n.bookTitle}</span>
+                    </p>
+                    {n.replyText && (
+                      <p className="font-['Lato',sans-serif] text-xs text-[#023047]/40 mt-0.5 line-clamp-1 italic">
+                        &ldquo;{n.replyText}&rdquo;
+                      </p>
+                    )}
+                    <p className="font-['Lato',sans-serif] text-[10px] text-[#023047]/30 mt-1">
+                      {relativeTime(n.createdAt)}
+                    </p>
+                  </div>
+                  <div className="flex gap-0.5 flex-shrink-0 mt-0.5">
+                    {!n.read && (
+                      <button
+                        onClick={() => markRead(n.id)}
+                        aria-label="Mark as read"
+                        title="Mark as read"
+                        className="p-1.5 rounded-full hover:bg-[#219ebc]/10 text-[#219ebc] transition-colors"
+                      >
+                        <Check size={12} />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => dismiss(n.id)}
+                      aria-label="Dismiss notification"
+                      title="Dismiss"
+                      className="p-1.5 rounded-full hover:bg-red-50 text-[#023047]/25 hover:text-red-400 transition-colors"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -265,12 +459,27 @@ function Navbar({
   onScrollTo: (id: string) => void;
 }) {
   const { user, logOut } = useAuth();
+  const { lang, setLang, t } = useLang();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!dropdownOpen) return;
+    const close = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [dropdownOpen]);
 
   const navLinks = [
-    { label: "Home", id: "hero" },
-    { label: "This Month", id: "book" },
-    { label: "How It Works", id: "howitworks" },
+    { label: t("nav.thisMonth"), id: "book" },
+    { label: t("nav.howItWorks"), id: "howitworks" },
+    { label: t("nav.suggestions"), id: "suggestions" },
   ];
 
   return (
@@ -278,19 +487,13 @@ function Navbar({
       className="fixed top-0 left-0 right-0 z-50 bg-white/96 backdrop-blur-md border-b border-gray-100"
       aria-label="Main navigation"
     >
-      <div className="max-w-6xl mx-auto px-5 flex items-center h-16 gap-4">
-        {/* Brand */}
-        <button
-          onClick={() => onScrollTo("hero")}
-          className="font-['Quando',serif] text-[#023047] text-lg leading-tight tracking-tight hover:text-[#219ebc] transition-colors flex-shrink-0"
-          aria-label="Go to top"
-        >
-          The Blue<br className="md:hidden" />{" "}
-          <span className="text-[#219ebc]">Book Club</span>
-        </button>
+      <div className="max-w-6xl mx-auto px-5 flex items-center h-16">
+
+        {/* Left spacer — keeps links truly centred */}
+        <div className="flex-1" />
 
         {/* Desktop links */}
-        <ul className="hidden md:flex flex-1 justify-center gap-1">
+        <ul className="hidden md:flex gap-1">
           {navLinks.map(({ label, id }) => (
             <li key={id}>
               <button
@@ -303,31 +506,100 @@ function Navbar({
           ))}
         </ul>
 
-        <div className="flex items-center gap-2 ml-auto">
+        {/* Right side — flex-1 so it mirrors the left spacer */}
+        <div className="flex-1 flex items-center justify-end gap-2">
+          <button
+            onClick={() => setLang(lang === "en" ? "fr" : "en")}
+            className="hidden md:block font-['Lato',sans-serif] text-sm font-bold text-[#023047]/40 hover:text-[#219ebc] transition-colors px-2"
+            aria-label="Toggle language"
+          >
+            {lang === "en" ? "FR" : "EN"}
+          </button>
+
+          {user && <NotificationBell uid={user.uid} />}
+
           {user ? (
-            <>
+            <div ref={dropdownRef} className="relative">
+              {/* Profile trigger */}
               <button
-                onClick={onProfile}
+                onClick={() => setDropdownOpen((v) => !v)}
                 className="flex items-center gap-2.5 px-3 py-1.5 rounded-full hover:bg-gray-100 transition-colors focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40"
-                aria-label="View your profile"
+                aria-label="Open profile menu"
+                aria-expanded={dropdownOpen}
               >
                 <Avatar src={user.photoURL} name={user.displayName} size={8} />
                 <span className="hidden md:block font-['Lato',sans-serif] text-sm font-bold text-[#023047]">
                   {user.displayName?.split(" ")[0]}
                 </span>
               </button>
-              <button
-                onClick={() => logOut().then(() => toast.success("You've been signed out."))}
-                className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[#023047]/50 hover:text-[#023047] hover:bg-gray-100 transition-colors text-sm font-['Lato',sans-serif] focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40"
-                aria-label="Sign out"
-              >
-                <LogOut size={14} />
-                Sign out
-              </button>
-            </>
+
+              {/* Dropdown */}
+              {dropdownOpen && (
+                <div className="absolute right-0 top-full mt-2 bg-white rounded-2xl shadow-xl border border-gray-100 w-52 overflow-hidden z-50">
+                  {/* User info */}
+                  <div className="px-4 py-3 border-b border-gray-100">
+                    <p className="font-['Lato',sans-serif] font-bold text-[#023047] text-sm leading-none">{user.displayName}</p>
+                    <p className="font-['Lato',sans-serif] text-[#023047]/40 text-xs mt-1">{user.email}</p>
+                  </div>
+                  {/* Actions */}
+                  <div className="py-1.5">
+                    <button
+                      onClick={() => { setDropdownOpen(false); onProfile(); }}
+                      className="w-full text-left px-4 py-2.5 font-['Lato',sans-serif] text-sm text-[#023047] hover:bg-gray-50 transition-colors flex items-center gap-2.5"
+                    >
+                      <BookOpen size={14} className="text-[#219ebc]" />
+                      {t("nav.suggestBook")}
+                    </button>
+                    <button
+                      onClick={() => { setDropdownOpen(false); onScrollTo("suggestions"); }}
+                      className="w-full text-left px-4 py-2.5 font-['Lato',sans-serif] text-sm text-[#023047] hover:bg-gray-50 transition-colors flex items-center gap-2.5"
+                    >
+                      <Check size={14} className="text-[#219ebc]" />
+                      {t("nav.vote")}
+                    </button>
+                    <button
+                      onClick={() => { setDropdownOpen(false); photoInputRef.current?.click(); }}
+                      className="w-full text-left px-4 py-2.5 font-['Lato',sans-serif] text-sm text-[#023047] hover:bg-gray-50 transition-colors flex items-center gap-2.5"
+                    >
+                      <UserIcon size={14} className="text-[#219ebc]" />
+                      {t("nav.editPicture")}
+                    </button>
+                    <div className="h-px bg-gray-100 mx-4 my-1" />
+                    <button
+                      onClick={() => { setDropdownOpen(false); logOut(); toast.success(t("auth.signOut.toast")); }}
+                      className="w-full text-left px-4 py-2.5 font-['Lato',sans-serif] text-sm text-red-400 hover:bg-red-50 transition-colors flex items-center gap-2.5"
+                    >
+                      <LogOut size={14} />
+                      {t("nav.signOut")}
+                    </button>
+                  </div>
+
+                  {/* Hidden photo upload input */}
+                  <input
+                    ref={photoInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (!file || !user) return;
+                      const reader = new FileReader();
+                      reader.onload = (ev) => {
+                        const dataUrl = ev.target?.result as string;
+                        setDoc(doc(db, "users", user.uid), { photoURL: dataUrl }, { merge: true })
+                          .then(() => toast.success("Profile picture updated."))
+                          .catch(() => toast.error("Failed to update picture."));
+                      };
+                      reader.readAsDataURL(file);
+                    }}
+                  />
+                </div>
+              )}
+            </div>
           ) : (
             <SignInButton />
           )}
+
           <button
             className="md:hidden p-2 rounded-full hover:bg-gray-100 text-[#023047] transition-colors"
             onClick={() => setMenuOpen((v) => !v)}
@@ -352,12 +624,26 @@ function Navbar({
             </button>
           ))}
           {user && (
-            <button
-              className="block w-full text-left px-4 py-3 rounded-xl font-['Lato',sans-serif] text-red-400 hover:bg-red-50 transition-all"
-              onClick={() => { setMenuOpen(false); logOut(); }}
-            >
-              Sign out
-            </button>
+            <>
+              <button
+                className="block w-full text-left px-4 py-3 rounded-xl font-['Lato',sans-serif] text-[#023047]/70 hover:bg-gray-50 transition-all"
+                onClick={() => { setMenuOpen(false); onProfile(); }}
+              >
+                {t("nav.suggestBook")}
+              </button>
+              <button
+                className="block w-full text-left px-4 py-3 rounded-xl font-['Lato',sans-serif] text-[#023047]/70 hover:bg-gray-50 transition-all"
+                onClick={() => { setMenuOpen(false); onScrollTo("suggestions"); }}
+              >
+                {t("nav.vote")}
+              </button>
+              <button
+                className="block w-full text-left px-4 py-3 rounded-xl font-['Lato',sans-serif] text-red-400 hover:bg-red-50 transition-all"
+                onClick={() => { setMenuOpen(false); logOut(); toast.success(t("auth.signOut.toast")); }}
+              >
+                {t("nav.signOut")}
+              </button>
+            </>
           )}
         </div>
       )}
@@ -369,6 +655,7 @@ function Navbar({
 
 function HeroSection() {
   const { user } = useAuth();
+  const { t } = useLang();
 
   return (
     <section id="hero" className="pt-16 bg-white">
@@ -384,7 +671,7 @@ function HeroSection() {
       {/* Tagline + CTA */}
       <div className="max-w-2xl mx-auto px-6 pb-12 text-center">
         <p className="font-['Quando',serif] text-[#219ebc] text-xl leading-relaxed italic">
-          Read one book together every month.
+          {t("hero.tagline")}
         </p>
       </div>
     </section>
@@ -395,6 +682,7 @@ function HeroSection() {
 
 function ReadingStatusPicker({ bookId }: { bookId: string }) {
   const { user } = useAuth();
+  const { t } = useLang();
   const [status, setStatus] = useState<"reading" | "finished" | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -408,15 +696,20 @@ function ReadingStatusPicker({ bookId }: { bookId: string }) {
   const pick = async (s: "reading" | "finished") => {
     if (!user || saving) return;
     setSaving(true);
+    const wasNotFinished = status !== "finished";
     try {
       await setDoc(doc(db, "readingStatus", `${user.uid}_${bookId}`), {
         userId: user.uid,
         bookId,
         status: s,
       });
-      toast.success(s === "reading" ? "Marked as reading." : "Marked as finished.");
+      toast.success(s === "reading" ? t("status.toast.reading") : t("status.toast.finished"));
+      // Award token the first time a book is finished
+      if (s === "finished" && wasNotFinished) {
+        await awardTokens(user.uid, 1, t("status.toast.token"));
+      }
     } catch {
-      toast.error("Couldn't update status. Try again.");
+      toast.error(t("status.error"));
     } finally {
       setSaving(false);
     }
@@ -425,7 +718,7 @@ function ReadingStatusPicker({ bookId }: { bookId: string }) {
   return (
     <div>
       <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40 mb-3">
-        My Status
+        {t("status.label")}
       </p>
       <div className="flex gap-2">
         <button
@@ -439,7 +732,7 @@ function ReadingStatusPicker({ bookId }: { bookId: string }) {
           } disabled:opacity-60`}
         >
           <Check size={15} />
-          Reading
+          {t("status.reading")}
         </button>
         <button
           onClick={() => pick("finished")}
@@ -452,7 +745,7 @@ function ReadingStatusPicker({ bookId }: { bookId: string }) {
           } disabled:opacity-60`}
         >
           <BookOpen size={15} />
-          Finished
+          {t("status.finished")}
         </button>
       </div>
     </div>
@@ -463,6 +756,7 @@ function ReadingStatusPicker({ bookId }: { bookId: string }) {
 
 function BookOfMonth() {
   const { user } = useAuth();
+  const { t } = useLang();
   const [book, setBook] = useState<Book | null>(null);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [statusCounts, setStatusCounts] = useState({ reading: 0, finished: 0 });
@@ -508,7 +802,7 @@ function BookOfMonth() {
         <div className="flex items-center gap-3 mb-8">
           <div className="h-px flex-1 bg-[#219ebc]/20" />
           <span className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#219ebc]">
-            Book of the Month
+            {t("book.label")}
           </span>
           <div className="h-px flex-1 bg-[#219ebc]/20" />
         </div>
@@ -519,13 +813,13 @@ function BookOfMonth() {
           /* Empty state */
           <div className="bg-white rounded-3xl border border-dashed border-gray-200 p-16 text-center">
             <h2 className="font-['Quando',serif] text-[#023047] text-2xl mb-3">
-              Next Book Coming Soon
+              {t("book.noBook.title")}
             </h2>
             <p className="font-['Lato',sans-serif] text-[#023047]/50 max-w-sm mx-auto leading-relaxed">
-              The community is selecting this month&apos;s book. Voting opens shortly.
+              {t("book.noBook.desc")}
             </p>
             <p className="font-['Lato',sans-serif] text-[#023047]/35 text-sm max-w-xs mx-auto mt-3">
-              Be ready to join the discussion as soon as it&apos;s announced.
+              {t("book.noBook.hint")}
             </p>
           </div>
         ) : (
@@ -571,7 +865,7 @@ function BookOfMonth() {
                         {avgRating.toFixed(1)}
                       </span>
                       <span className="font-['Lato',sans-serif] text-[#023047]/40 text-sm">
-                        ({reviews.length} {reviews.length === 1 ? "review" : "reviews"})
+                        ({reviews.length} {reviews.length === 1 ? t("stats.review") : t("stats.reviews")})
                       </span>
                     </div>
                   )}
@@ -587,7 +881,7 @@ function BookOfMonth() {
                           onClick={() => setDescExpanded((v) => !v)}
                           className="mt-1.5 font-['Lato',sans-serif] text-[#219ebc] text-sm font-bold hover:underline focus:outline-none"
                         >
-                          {descExpanded ? "Show less" : "Read more"}
+                          {descExpanded ? t("book.showLess") : t("book.readMore")}
                         </button>
                       )}
                     </div>
@@ -603,9 +897,9 @@ function BookOfMonth() {
                           onClick={() => document.getElementById("hero")?.scrollIntoView({ behavior: "smooth" })}
                           className="text-[#219ebc] font-bold hover:underline"
                         >
-                          Sign in
+                          {t("auth.signIn")}
                         </button>{" "}
-                        to track your progress and join the discussion.
+                        {t("book.signInPrompt.text")}
                       </p>
                     </div>
                   )}
@@ -618,21 +912,21 @@ function BookOfMonth() {
                   <Users size={15} className="text-[#219ebc] flex-shrink-0" />
                   <div>
                     <span className="font-['Lato',sans-serif] font-bold text-[#023047] text-sm">{statusCounts.reading}</span>
-                    <span className="font-['Lato',sans-serif] text-[#023047]/40 text-xs ml-1">reading</span>
+                    <span className="font-['Lato',sans-serif] text-[#023047]/40 text-xs ml-1">{t("stats.reading")}</span>
                   </div>
                 </div>
                 <div className="flex items-center justify-center gap-2 py-4 px-4 text-center">
                   <CheckCheck size={15} className="text-[#219ebc] flex-shrink-0" />
                   <div>
                     <span className="font-['Lato',sans-serif] font-bold text-[#023047] text-sm">{statusCounts.finished}</span>
-                    <span className="font-['Lato',sans-serif] text-[#023047]/40 text-xs ml-1">finished</span>
+                    <span className="font-['Lato',sans-serif] text-[#023047]/40 text-xs ml-1">{t("stats.finished")}</span>
                   </div>
                 </div>
                 <div className="flex items-center justify-center gap-2 py-4 px-4 text-center">
                   <MessageSquare size={15} className="text-[#219ebc] flex-shrink-0" />
                   <div>
                     <span className="font-['Lato',sans-serif] font-bold text-[#023047] text-sm">{reviews.length}</span>
-                    <span className="font-['Lato',sans-serif] text-[#023047]/40 text-xs ml-1">{reviews.length === 1 ? "review" : "reviews"}</span>
+                    <span className="font-['Lato',sans-serif] text-[#023047]/40 text-xs ml-1">{reviews.length === 1 ? t("stats.review") : t("stats.reviews")}</span>
                   </div>
                 </div>
               </div>
@@ -663,6 +957,7 @@ function ReviewForm({
   onDone: () => void;
 }) {
   const { user } = useAuth();
+  const { t } = useLang();
   const [rating, setRating] = useState(existing?.rating ?? 0);
   const [text, setText] = useState(existing?.text ?? "");
   const [saving, setSaving] = useState(false);
@@ -670,14 +965,14 @@ function ReviewForm({
 
   const handleSubmit = async () => {
     if (!user || rating === 0) {
-      toast.error("Please select a star rating before posting.");
+      toast.error(t("reviews.ratingError"));
       return;
     }
     setSaving(true);
     try {
       if (existing) {
         await updateDoc(doc(db, "reviews", existing.id), { rating, text });
-        toast.success("Review updated!");
+        toast.success(t("reviews.updated"));
       } else {
         await addDoc(collection(db, "reviews"), {
           bookId,
@@ -688,11 +983,12 @@ function ReviewForm({
           text,
           createdAt: serverTimestamp(),
         });
-        toast.success("Review posted.");
+        toast.success(t("reviews.posted"));
+        await awardTokens(user.uid, 1, t("reviews.token"));
       }
       onDone();
     } catch {
-      toast.error("Couldn't save your review. Please try again.");
+      toast.error(t("reviews.saveError"));
     } finally {
       setSaving(false);
     }
@@ -703,13 +999,13 @@ function ReviewForm({
       {/* Star picker */}
       <div>
         <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40 mb-3">
-          How would you rate it?
+          {t("reviews.ratingLabel")}
         </p>
         <div className="flex items-center gap-3">
           <StarRating value={rating} onChange={setRating} size={30} />
           {rating > 0 && (
             <span className="font-['Lato',sans-serif] text-[#023047]/40 text-sm">
-              {["", "Poor", "Fair", "Good", "Great", "Amazing"][rating]}
+              {["", t("rating.1"), t("rating.2"), t("rating.3"), t("rating.4"), t("rating.5")][rating]}
             </span>
           )}
         </div>
@@ -719,18 +1015,18 @@ function ReviewForm({
       <div>
         <div className="flex justify-between items-center mb-2">
           <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40">
-            Your thoughts <span className="normal-case tracking-normal font-normal">(optional)</span>
+            {t("reviews.thoughtsLabel")} <span className="normal-case tracking-normal font-normal">({t("reviews.optional")})</span>
           </p>
           {text.length > 0 && (
             <span className={`font-['Lato',sans-serif] text-xs tabular-nums ${remaining < 50 ? "text-red-400" : "text-[#023047]/30"}`}>
-              {remaining} left
+              {remaining} {t("reviews.charsLeft")}
             </span>
           )}
         </div>
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value.slice(0, MAX_REVIEW))}
-          placeholder={`What did you think about ${bookTitle}?`}
+          placeholder={`${t("reviews.placeholder")} ${bookTitle}?`}
           rows={4}
           aria-label="Write your review"
           className="w-full border border-gray-200 rounded-2xl px-5 py-4 font-['Lato',sans-serif] text-[#023047] text-[15px] leading-relaxed resize-none focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40 focus:border-[#219ebc]/40 transition-all placeholder:text-[#023047]/25"
@@ -745,14 +1041,14 @@ function ReviewForm({
           className="px-6 py-2.5 bg-[#219ebc] text-white rounded-full font-['Lato',sans-serif] text-sm font-bold hover:bg-[#1a8fa8] hover:shadow-md transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:shadow-none focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#219ebc]/60"
           title={rating === 0 ? "Select a star rating first" : undefined}
         >
-          {saving ? "Saving…" : existing ? "Update Review" : "Post Review"}
+          {saving ? t("reviews.saving") : existing ? t("reviews.updateReview") : t("reviews.postReview")}
         </button>
         {(existing || text) && (
           <button
             onClick={onDone}
             className="px-5 py-2.5 rounded-full font-['Lato',sans-serif] text-sm text-[#023047]/50 hover:text-[#023047] hover:bg-gray-100 transition-all"
           >
-            Cancel
+            {t("reviews.cancel")}
           </button>
         )}
       </div>
@@ -851,6 +1147,7 @@ function ReviewSection({
   reviews: Review[];
 }) {
   const { user } = useAuth();
+  const { t } = useLang();
   const myReview = reviews.find((r) => r.userId === user?.uid);
   const otherReviews = reviews.filter((r) => r.userId !== user?.uid);
   const [editMode, setEditMode] = useState(false);
@@ -874,7 +1171,7 @@ function ReviewSection({
       {/* Header */}
       <div className="flex items-baseline justify-between">
         <h3 className="font-['Quando',serif] text-[#023047] text-xl">
-          Community Reviews
+          {t("reviews.title")}
           {reviews.length > 0 && (
             <span className="ml-2 font-['Lato',sans-serif] font-normal text-base text-[#023047]/40">
               ({reviews.length})
@@ -888,7 +1185,7 @@ function ReviewSection({
         {myReview && !editMode ? (
           <>
             <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#219ebc] mb-4">
-              Your Review
+              {t("reviews.yourReview")}
             </p>
             <ReviewCard
               review={myReview}
@@ -901,7 +1198,7 @@ function ReviewSection({
         ) : (
           <>
             <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40 mb-5">
-              {myReview ? "Edit Your Review" : "Share Your Thoughts"}
+              {myReview ? t("reviews.editReview") : t("reviews.shareThoughts")}
             </p>
             <ReviewForm
               bookId={bookId}
@@ -917,10 +1214,10 @@ function ReviewSection({
       {otherReviews.length === 0 ? (
         <div className="text-center py-10">
           <p className="font-['Quando',serif] text-[#023047] text-lg mb-1">
-            No other reviews yet
+            {t("reviews.noOther.title")}
           </p>
           <p className="font-['Lato',sans-serif] text-[#023047]/40 text-sm">
-            Your review appears in the section above. Other members&apos; reviews will show here.
+            {t("reviews.noOther.hint")}
           </p>
         </div>
       ) : (
@@ -938,6 +1235,7 @@ function ReviewSection({
 
 function VotingSection() {
   const { user } = useAuth();
+  const { t } = useLang();
   const [candidates, setCandidates] = useState<Book[]>([]);
   const [votes, setVotes] = useState<Vote[]>([]);
   const [myVote, setMyVote] = useState<string | null>(null);
@@ -966,7 +1264,7 @@ function VotingSection() {
     try {
       if (myVote === bookId) {
         await deleteDoc(doc(db, "votes", user.uid));
-        toast.success("Vote removed.");
+        toast.success(t("vote.removed"));
       } else {
         const now = new Date();
         await setDoc(doc(db, "votes", user.uid), {
@@ -975,10 +1273,10 @@ function VotingSection() {
           month: now.getMonth() + 1,
           year: now.getFullYear(),
         });
-        toast.success(myVote ? "Vote updated." : "Vote cast.");
+        toast.success(myVote ? t("vote.updated") : t("vote.cast"));
       }
     } catch {
-      toast.error("Couldn't save vote. Please try again.");
+      toast.error(t("vote.error"));
     } finally {
       setSaving(false);
     }
@@ -995,19 +1293,19 @@ function VotingSection() {
         <div className="flex items-center gap-3 mb-8">
           <div className="h-px flex-1 bg-[#023047]/10" />
           <span className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40">
-            Vote for Next Month
+            {t("vote.label")}
           </span>
           <div className="h-px flex-1 bg-[#023047]/10" />
         </div>
 
         <div className="text-center mb-10">
           <h2 className="font-['Quando',serif] text-[#023047] text-3xl mb-2">
-            What should we read next?
+            {t("vote.title")}
           </h2>
           <p className="font-['Lato',sans-serif] text-[#023047]/50">
             {totalVotes > 0
-              ? `${totalVotes} member${totalVotes !== 1 ? "s" : ""} have voted${myVote ? " · You can change your vote anytime" : ""}`
-              : "Be the first to vote!"}
+              ? `${totalVotes} member${totalVotes !== 1 ? "s" : ""} ${t("vote.voted")}${myVote ? ` · ${t("vote.changeVote")}` : ""}`
+              : t("vote.firstVote")}
           </p>
         </div>
 
@@ -1056,12 +1354,12 @@ function VotingSection() {
                     )}
                     {isLeading && !voted && (
                       <span className="inline-flex items-center gap-1.5 bg-[#ffb703] text-[#023047] text-xs font-bold font-['Lato',sans-serif] px-3 py-1.5 rounded-full">
-                        Leading
+                        {t("picks.leading")}
                       </span>
                     )}
                     {isLeading && voted && (
                       <span className="inline-flex items-center gap-1.5 bg-[#ffb703] text-[#023047] text-xs font-bold font-['Lato',sans-serif] px-3 py-1.5 rounded-full">
-                        Leading
+                        {t("picks.leading")}
                       </span>
                     )}
                   </div>
@@ -1109,10 +1407,10 @@ function VotingSection() {
                     >
                       {voted ? (
                         <>
-                          <span className="group-hover/btn:hidden">Voted ✓</span>
-                          <span className="hidden group-hover/btn:inline">Remove vote</span>
+                          <span className="group-hover/btn:hidden">{t("vote.voted.label")} ✓</span>
+                          <span className="hidden group-hover/btn:inline">{t("vote.remove")}</span>
                         </>
-                      ) : "Vote for this book"}
+                      ) : t("vote.button")}
                     </button>
                   )}
                 </div>
@@ -1128,138 +1426,115 @@ function VotingSection() {
 // ─── User Profile Modal ───────────────────────────────────────────────────────
 
 function UserProfileModal({ onClose }: { onClose: () => void }) {
-  const { user, logOut } = useAuth();
-  const [reviews, setReviews] = useState<Review[]>([]);
-  const [myStatus, setMyStatus] = useState<ReadingStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { user } = useAuth();
+  const { t } = useLang();
+  const [mySuggestions, setMySuggestions] = useState<Suggestion[]>([]);
+  const [suggestionSupports, setSuggestionSupports] = useState<Support[]>([]);
+  const [editingSuggestion, setEditingSuggestion] = useState<Suggestion | null>(null);
+  const tokenBalance = useTokenBalance(user?.uid);
 
   useEffect(() => {
     if (!user) return;
     const unsub1 = onSnapshot(
-      query(collection(db, "reviews"), where("userId", "==", user.uid)),
-      (snap) => { setReviews(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Review))); setLoading(false); }
+      query(collection(db, "suggestions"), where("userId", "==", user.uid)),
+      (snap) => setMySuggestions(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Suggestion)))
     );
     const unsub2 = onSnapshot(
-      query(collection(db, "readingStatus"), where("userId", "==", user.uid)),
-      (snap) => setMyStatus(snap.empty ? null : ({ id: snap.docs[0].id, ...snap.docs[0].data() } as ReadingStatus))
+      query(collection(db, "supports"), where("suggestionOwnerId", "==", user.uid)),
+      (snap) => setSuggestionSupports(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Support)))
     );
     return () => { unsub1(); unsub2(); };
   }, [user?.uid]);
 
-  const avgRating = reviews.length > 0
-    ? (reviews.reduce((s, r) => s + r.rating, 0) / reviews.length).toFixed(1)
-    : null;
+  const mySuggestion = mySuggestions[0] ?? null;
+
+  const handleDeleteSuggestion = async () => {
+    if (!mySuggestion) return;
+    await deleteDoc(doc(db, "suggestions", mySuggestion.id));
+    toast.success(t("suggest.removed"));
+  };
 
   if (!user) return null;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Your profile"
+      aria-label="Suggest a book"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="bg-white rounded-3xl shadow-2xl w-full max-w-sm overflow-hidden">
-        {/* Teal header */}
-        <div className="bg-gradient-to-br from-[#219ebc] to-[#1a8aa6] px-6 pt-8 pb-8 relative text-center">
-          <button
-            onClick={onClose}
-            aria-label="Close profile"
-            className="absolute top-4 right-4 p-2 rounded-full bg-white/20 text-white hover:bg-white/30 transition-colors focus:outline-none focus:ring-2 focus:ring-white/50"
-          >
-            <X size={16} />
-          </button>
+      <div className="bg-white rounded-3xl shadow-2xl w-full h-full overflow-y-auto relative">
 
-          {/* Avatar with upload overlay */}
-          <div className="relative inline-block">
-            <Avatar src={user.photoURL} name={user.displayName} size={20} />
-            <label
-              htmlFor="profile-photo-upload"
-              aria-label="Change profile picture"
-              className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-white flex items-center justify-center cursor-pointer shadow-md hover:bg-gray-50 transition-colors"
-              title="Change profile picture"
-            >
-              <Edit2 size={12} className="text-[#219ebc]" />
-            </label>
-            <input
-              id="profile-photo-upload"
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-                const reader = new FileReader();
-                reader.onload = (ev) => {
-                  const dataUrl = ev.target?.result as string;
-                  // Update Firestore user doc with new photo
-                  setDoc(doc(db, "users", user.uid), { photoURL: dataUrl }, { merge: true })
-                    .then(() => toast.success("Profile picture updated."))
-                    .catch(() => toast.error("Failed to update picture."));
-                };
-                reader.readAsDataURL(file);
-              }}
-            />
-          </div>
+        {/* Close button */}
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          className="absolute top-4 right-4 p-2 rounded-full hover:bg-gray-100 text-[#023047]/40 transition-colors z-10"
+        >
+          <X size={16} />
+        </button>
 
-          <h2 className="font-['Quando',serif] text-white text-2xl mt-4 mb-1">
-            {user.displayName}
-          </h2>
-          <p className="font-['Lato',sans-serif] text-white/70 text-sm">{user.email}</p>
-        </div>
-
-        {/* Stats card (overlapping header) */}
-        <div className="px-6 pt-6 pb-4">
-          <div className="grid grid-cols-3 divide-x divide-gray-100 border border-gray-100 rounded-2xl overflow-hidden">
+        {/* Token rules */}
+        <div className="px-6 pt-6 pb-4 border-b border-gray-100">
+          <p className="font-['Quando',serif] text-[#023047] text-lg mb-4">
+            {t("suggest.modal.title")}
+          </p>
+          <div className="flex flex-wrap gap-3">
             {[
-              { value: reviews.length.toString(), label: "Reviews" },
-              { value: avgRating ?? "—", label: "Avg. Stars" },
-              { value: myStatus?.status === "reading" ? "Reading" : myStatus?.status === "finished" ? "Finished" : "—", label: "Status" },
-            ].map(({ value, label }) => (
-              <div key={label} className="py-5 text-center bg-white">
-                <p className="font-['Quando',serif] text-[#023047] text-xl leading-none">{value}</p>
-                <p className="font-['Lato',sans-serif] text-[#023047]/40 text-xs mt-2">{label}</p>
+              { label: t("suggest.tokenRules.finish"), value: t("suggest.tokenRules.earn"), earn: true },
+              { label: t("suggest.tokenRules.receive"), value: t("suggest.tokenRules.earn"), earn: true },
+              { label: t("suggest.tokenRules.spend"), value: t("suggest.tokenRules.cost"), earn: false },
+            ].map(({ label, value, earn }) => (
+              <div key={label} className="flex items-center gap-2 bg-gray-50 rounded-xl px-3 py-2">
+                <span className="font-['Lato',sans-serif] text-sm text-[#023047]/60">{label}</span>
+                <span className={`font-['Lato',sans-serif] text-sm font-bold flex-shrink-0 ${earn ? "text-[#219ebc]" : "text-[#023047]/45"}`}>{value}</span>
               </div>
             ))}
           </div>
+          <p className="font-['Lato',sans-serif] text-[11px] text-[#023047]/35 mt-3">
+            {t("suggest.tokenRules.limit")}
+          </p>
         </div>
 
-        {/* Review list */}
-        {loading ? (
-          <div className="px-6 pb-6 space-y-3">
-            <ReviewSkeleton />
-          </div>
-        ) : reviews.length === 0 ? (
-          <div className="px-6 pb-8 text-center">
-            <p className="font-['Lato',sans-serif] text-[#023047]/40 text-sm">
-              No reviews yet.
-            </p>
-          </div>
-        ) : (
-          <div className="px-6 pb-2 max-h-52 overflow-y-auto space-y-3">
-            {reviews.map((r) => (
-              <div key={r.id} className="flex gap-3 py-3 border-b border-gray-50 last:border-0">
-                <StarRating value={r.rating} readonly size={14} />
-                {r.text && (
-                  <p className="font-['Lato',sans-serif] text-[#023047]/60 text-sm line-clamp-2 flex-1">
-                    {r.text}
-                  </p>
+        {/* Suggestion area */}
+        <div className="px-6 pt-5 pb-6">
+          {editingSuggestion ? (
+            <SuggestionForm
+              existing={editingSuggestion}
+              onDone={() => setEditingSuggestion(null)}
+            />
+          ) : mySuggestion ? (
+            <div className="bg-gray-50 rounded-2xl p-4 flex gap-3 items-start">
+              <div className="flex-shrink-0 w-10 h-14 rounded-lg overflow-hidden bg-gray-200 flex items-center justify-center">
+                {mySuggestion.coverImage ? (
+                  <img src={mySuggestion.coverImage} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                ) : (
+                  <BookOpen size={14} className="text-[#219ebc]/40" />
                 )}
               </div>
-            ))}
-          </div>
-        )}
-
-        {/* Sign out */}
-        <div className="px-6 pt-3 pb-6">
-          <button
-            onClick={() => { logOut(); onClose(); }}
-            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-['Lato',sans-serif] text-sm text-[#023047]/50 hover:text-[#023047] hover:bg-gray-50 transition-all border border-gray-100"
-          >
-            <LogOut size={14} />
-            Sign out
-          </button>
+              <div className="flex-1 min-w-0">
+                <p className="font-['Quando',serif] text-[#023047] text-sm truncate">{mySuggestion.title}</p>
+                <p className="font-['Lato',sans-serif] text-[#023047]/45 text-sm">{mySuggestion.author}</p>
+                <div className="flex items-center gap-1 mt-1.5">
+                  <ThumbsUp size={11} className="text-[#219ebc]" />
+                  <span className="font-['Lato',sans-serif] text-sm text-[#023047]/50">
+                    {suggestionSupports.filter((x) => x.suggestionId === mySuggestion.id).length} {t("picks.supports")}
+                  </span>
+                </div>
+              </div>
+              <div className="flex gap-1">
+                <button onClick={() => setEditingSuggestion(mySuggestion)} className="p-1.5 rounded-full text-[#023047]/30 hover:text-[#219ebc] hover:bg-[#219ebc]/8 transition-all" aria-label="Edit">
+                  <Edit2 size={12} />
+                </button>
+                <button onClick={handleDeleteSuggestion} className="p-1.5 rounded-full text-[#023047]/30 hover:text-red-400 hover:bg-red-50 transition-all" aria-label="Delete">
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <SuggestionForm onDone={onClose} />
+          )}
         </div>
       </div>
     </div>
@@ -1342,24 +1617,26 @@ function EthosSection() {
 
 // ─── How It Works section ─────────────────────────────────────────────────────
 
-const HOW_IT_WORKS = [
-  { img: img1, title: "Discover", desc: "See the Book of the Month and decide if you want to join." },
-  { img: img2, title: "Read", desc: "Track your progress as you read at your own pace." },
-  { img: img3, title: "Share", desc: "Leave a rating, write a review, and see what others think before voting for the next book." },
-];
-
 function HowItWorksSection() {
+  const { t } = useLang();
+
+  const items = [
+    { img: img1, title: t("how.discover.title"), desc: t("how.discover.desc") },
+    { img: imgGirlReading, title: t("how.read.title"), desc: t("how.read.desc") },
+    { img: imgSpeechBubble, title: t("how.share.title"), desc: t("how.share.desc") },
+  ];
+
   return (
     <section id="howitworks" className="py-20 bg-[#f4fafb]">
       <div className="max-w-4xl mx-auto px-5">
         <div className="text-center mb-12">
           <h2 className="font-['Quando',serif] text-[#023047] text-3xl">
-            How it works
+            {t("how.title")}
           </h2>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
-          {HOW_IT_WORKS.map((c, i) => (
+          {items.map((c, i) => (
             <div
               key={c.title}
               className="bg-white rounded-2xl p-6 text-center border border-gray-100 hover:border-[#219ebc]/25 hover:shadow-md transition-all duration-200 group"
@@ -1367,11 +1644,13 @@ function HowItWorksSection() {
               <div className="w-10 h-10 rounded-full bg-[#219ebc]/10 flex items-center justify-center mx-auto mb-5 font-['Quando',serif] text-[#219ebc] text-lg font-bold group-hover:bg-[#219ebc] group-hover:text-white transition-all">
                 {i + 1}
               </div>
-              <img
-                src={c.img}
-                alt={c.title}
-                className="w-28 mx-auto object-contain mb-5"
-              />
+              <div className="h-28 flex items-center justify-center mb-5">
+                <img
+                  src={c.img}
+                  alt={c.title}
+                  className="w-28 h-full object-contain"
+                />
+              </div>
               <h3 className="font-['Quando',serif] text-[#023047] text-xl mb-3">{c.title}</h3>
               <p className="font-['Lato',sans-serif] text-[#023047]/55 text-sm leading-relaxed">
                 {c.desc}
@@ -1384,75 +1663,750 @@ function HowItWorksSection() {
   );
 }
 
-// ─── Footer ───────────────────────────────────────────────────────────────────
+// ─── Suggestions ─────────────────────────────────────────────────────────────
 
-function FooterSection() {
-  const scrollTo = (id: string) =>
-    document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
+function SuggestionForm({
+  existing,
+  onDone,
+}: {
+  existing?: Suggestion;
+  onDone: () => void;
+}) {
+  const { user } = useAuth();
+  const { t } = useLang();
+  const [title, setTitle] = useState(existing?.title ?? "");
+  const [author, setAuthor] = useState(existing?.author ?? "");
+  const [coverImage, setCoverImage] = useState(existing?.coverImage ?? "");
+  const [description, setDescription] = useState(existing?.description ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!user || !title.trim() || !author.trim()) {
+      toast.error(t("suggest.form.required"));
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        userId: user.uid,
+        userName: user.displayName ?? "Anonymous",
+        userPhoto: user.photoURL ?? "",
+        title: title.trim(),
+        author: author.trim(),
+        coverImage: coverImage.trim(),
+        description: description.trim().slice(0, MAX_SUGGESTION_DESC),
+        createdAt: serverTimestamp(),
+      };
+      if (existing) {
+        await updateDoc(doc(db, "suggestions", existing.id), payload);
+        toast.success(t("suggest.updated"));
+      } else {
+        await addDoc(collection(db, "suggestions"), payload);
+        toast.success(t("suggest.added"));
+      }
+      onDone();
+    } catch {
+      toast.error(t("suggest.error"));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
-    <footer id="contact" className="bg-[#023047]">
-      <div className="max-w-4xl mx-auto px-6 pt-16 pb-10">
+    <div className="bg-white rounded-2xl border border-[#219ebc]/20 p-6 space-y-4">
+      {existing && (
+        <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40 mb-1">
+          {t("suggest.form.edit")}
+        </p>
+      )}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label className="block font-['Lato',sans-serif] text-xs font-bold text-[#023047]/50 mb-1.5">
+            {t("suggest.form.title")} <span className="text-red-400">*</span>
+          </label>
+          <input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder={t("suggest.form.titlePlaceholder")}
+            className="w-full border border-gray-200 rounded-xl px-4 py-2.5 font-['Lato',sans-serif] text-sm text-[#023047] focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40 focus:border-[#219ebc]/40"
+          />
+        </div>
+        <div>
+          <label className="block font-['Lato',sans-serif] text-xs font-bold text-[#023047]/50 mb-1.5">
+            {t("suggest.form.author")} <span className="text-red-400">*</span>
+          </label>
+          <input
+            value={author}
+            onChange={(e) => setAuthor(e.target.value)}
+            placeholder="e.g. F. Scott Fitzgerald"
+            className="w-full border border-gray-200 rounded-xl px-4 py-2.5 font-['Lato',sans-serif] text-sm text-[#023047] focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40 focus:border-[#219ebc]/40"
+          />
+        </div>
+      </div>
+      <div>
+        <label className="block font-['Lato',sans-serif] text-xs font-bold text-[#023047]/50 mb-1.5">
+          {t("suggest.form.coverUrl")} <span className="font-normal">({t("reviews.optional")})</span>
+        </label>
+        <input
+          value={coverImage}
+          onChange={(e) => setCoverImage(e.target.value)}
+          placeholder="https://…"
+          className="w-full border border-gray-200 rounded-xl px-4 py-2.5 font-['Lato',sans-serif] text-sm text-[#023047] focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40 focus:border-[#219ebc]/40"
+        />
+      </div>
+      <div>
+        <div className="flex justify-between items-center mb-1.5">
+          <label className="font-['Lato',sans-serif] text-xs font-bold text-[#023047]/50">
+            {t("suggest.form.why")} <span className="font-normal">({t("reviews.optional")})</span>
+          </label>
+          {description.length > 0 && (
+            <span className={`font-['Lato',sans-serif] text-xs tabular-nums ${description.length >= MAX_SUGGESTION_DESC - 20 ? "text-red-400" : "text-[#023047]/30"}`}>
+              {MAX_SUGGESTION_DESC - description.length} left
+            </span>
+          )}
+        </div>
+        <textarea
+          value={description}
+          onChange={(e) => setDescription(e.target.value.slice(0, MAX_SUGGESTION_DESC))}
+          placeholder="A short reason why this book would make a great pick…"
+          rows={2}
+          className="w-full border border-gray-200 rounded-xl px-4 py-3 font-['Lato',sans-serif] text-sm text-[#023047] resize-none focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40 focus:border-[#219ebc]/40 placeholder:text-[#023047]/25"
+        />
+      </div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={handleSubmit}
+          disabled={saving || !title.trim() || !author.trim()}
+          className="px-6 py-2.5 bg-[#219ebc] text-white rounded-full font-['Lato',sans-serif] text-sm font-bold hover:bg-[#1a8fa8] transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {saving ? t("suggest.form.saving") : existing ? t("suggest.form.update") : t("suggest.form.submit")}
+        </button>
+        <button
+          onClick={onDone}
+          className="px-4 py-2.5 rounded-full font-['Lato',sans-serif] text-sm text-[#023047]/50 hover:text-[#023047] hover:bg-gray-100 transition-all"
+        >
+          {t("suggest.form.cancel")}
+        </button>
+      </div>
+    </div>
+  );
+}
 
-        {/* Main row */}
-        <div className="flex flex-col md:flex-row md:items-start justify-between gap-10 mb-12">
+function SuggestionCard({
+  suggestion,
+  supportCount,
+  mySupportsCount,
+  tokenBalance,
+  isOwn,
+  onSupport,
+  onEdit,
+  onDelete,
+}: {
+  suggestion: Suggestion;
+  supportCount: number;
+  mySupportsCount: number;
+  tokenBalance: number;
+  isOwn: boolean;
+  onSupport: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const { t } = useLang();
 
-          {/* Brand */}
-          <div className="max-w-xs">
-            <p className="font-['Quando',serif] text-white text-xl mb-3">
-              The Blue Book Club
+  return (
+    <div className={`bg-white rounded-2xl border flex gap-4 p-5 transition-all ${isOwn ? "border-[#219ebc]/25" : "border-gray-100 hover:border-gray-200"}`}>
+      {/* Cover */}
+      <div className="flex-shrink-0 w-14 h-20 rounded-xl overflow-hidden bg-gray-100 flex items-center justify-center">
+        {suggestion.coverImage ? (
+          <img
+            src={suggestion.coverImage}
+            alt={suggestion.title}
+            className="w-full h-full object-cover"
+            referrerPolicy="no-referrer"
+            onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+          />
+        ) : (
+          <BookOpen size={20} className="text-[#219ebc]/40" />
+        )}
+      </div>
+
+      {/* Info */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <p className="font-['Quando',serif] text-[#023047] text-base leading-snug truncate">
+              {suggestion.title}
             </p>
-            <p className="font-['Lato',sans-serif] text-white/50 text-sm leading-relaxed">
-              A monthly reading community built around one shared book.
+            <p className="font-['Lato',sans-serif] text-[#023047]/45 text-sm mt-0.5">
+              {suggestion.author}
             </p>
           </div>
+          {isOwn && (
+            <div className="flex gap-1 flex-shrink-0">
+              <button
+                onClick={onEdit}
+                aria-label="Edit suggestion"
+                className="p-1.5 rounded-full text-[#023047]/30 hover:text-[#219ebc] hover:bg-[#219ebc]/8 transition-all"
+              >
+                <Edit2 size={13} />
+              </button>
+              <button
+                onClick={onDelete}
+                aria-label="Delete suggestion"
+                className="p-1.5 rounded-full text-[#023047]/30 hover:text-red-400 hover:bg-red-50 transition-all"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+          )}
+        </div>
 
-          {/* Nav links */}
+        {suggestion.description && (
+          <p className="font-['Lato',sans-serif] text-[#023047]/55 text-[13px] leading-relaxed mt-2 line-clamp-2">
+            {suggestion.description}
+          </p>
+        )}
+
+        <div className="flex items-center justify-between mt-3">
+          {/* Suggested by */}
+          <div className="flex items-center gap-1.5">
+            <Avatar src={suggestion.userPhoto} name={suggestion.userName} size={5} />
+            <span className="font-['Lato',sans-serif] text-[#023047]/35 text-xs">
+              {isOwn ? "Your suggestion" : suggestion.userName}
+            </span>
+          </div>
+
+          {/* Support area */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1">
+              <ThumbsUp size={13} className="text-[#219ebc]" />
+              <span className="font-['Lato',sans-serif] text-sm font-bold text-[#023047]">
+                {supportCount}
+              </span>
+            </div>
+            {!isOwn && (
+              <button
+                onClick={onSupport}
+                disabled={tokenBalance < 1}
+                title={tokenBalance < 1 ? "You need tokens to support — finish a book or write a review to earn them" : `Support with 1 token${mySupportsCount > 0 ? ` (you've supported ${mySupportsCount}×)` : ""}`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full font-['Lato',sans-serif] text-xs font-bold transition-all ${
+                  tokenBalance < 1
+                    ? "bg-gray-100 text-[#023047]/30 cursor-not-allowed"
+                    : "bg-[#ffb703]/15 text-[#023047] hover:bg-[#ffb703]/30 active:scale-95"
+                }`}
+              >
+                <Sparkles size={11} className={tokenBalance < 1 ? "text-[#023047]/25" : "text-[#ffb703]"} />
+                {t("picks.support")}{mySupportsCount > 0 ? ` ×${mySupportsCount + 1}` : ""}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SuggestionsSection() {
+  const { user } = useAuth();
+  const { t } = useLang();
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [supports, setSupports] = useState<Support[]>([]);
+  const [supporting, setSupporting] = useState<string | null>(null);
+  const tokenBalance = useTokenBalance(user?.uid);
+
+  useEffect(() => {
+    return onSnapshot(collection(db, "suggestions"), (snap) => {
+      setSuggestions(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Suggestion)));
+    });
+  }, []);
+
+  useEffect(() => {
+    return onSnapshot(collection(db, "supports"), (snap) => {
+      setSupports(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Support)));
+    });
+  }, []);
+
+  const sorted = [...suggestions].sort((a, b) => {
+    const aS = supports.filter((x) => x.suggestionId === a.id).length;
+    const bS = supports.filter((x) => x.suggestionId === b.id).length;
+    return bS - aS;
+  });
+
+  const handleSupport = async (suggestion: Suggestion) => {
+    if (!user || tokenBalance < 1 || supporting) return;
+    setSupporting(suggestion.id);
+    try {
+      await updateDoc(doc(db, "users", user.uid), { tokenBalance: increment(-1) });
+      await addDoc(collection(db, "supports"), {
+        userId: user.uid,
+        suggestionId: suggestion.id,
+        suggestionOwnerId: suggestion.userId,
+        createdAt: serverTimestamp(),
+      });
+      await updateDoc(doc(db, "users", suggestion.userId), { tokenBalance: increment(2) });
+      toast.success(t("picks.supportToast"), { duration: 2500 });
+    } catch {
+      toast.error(t("picks.supportError"));
+    } finally {
+      setSupporting(null);
+    }
+  };
+
+  return (
+    <section id="suggestions" className="py-16 bg-[#f4fafb]">
+      <div className="max-w-4xl mx-auto px-5">
+
+        <div className="flex items-center gap-3 mb-8">
+          <div className="h-px flex-1 bg-[#219ebc]/20" />
+          <span className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#219ebc]">
+            {t("picks.label")}
+          </span>
+          <div className="h-px flex-1 bg-[#219ebc]/20" />
+        </div>
+
+        <div className="text-center mb-8">
+          <p className="font-['Lato',sans-serif] text-[#023047]/50 text-sm">
+            {t("picks.subtitle")}
+          </p>
+        </div>
+
+        {sorted.length === 0 ? (
+          <div className="text-center py-10 border border-dashed border-gray-200 rounded-2xl">
+            <p className="font-['Quando',serif] text-[#023047] text-lg mb-1">{t("picks.empty.title")}</p>
+            <p className="font-['Lato',sans-serif] text-[#023047]/40 text-sm">
+              {t("picks.empty.hint")}
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {sorted.map((s) => {
+              const isOwn = s.userId === user?.uid;
+              const supportCount = supports.filter((x) => x.suggestionId === s.id).length;
+              const mySupportsCount = supports.filter((x) => x.suggestionId === s.id && x.userId === user?.uid).length;
+              return (
+                <SuggestionCard
+                  key={s.id}
+                  suggestion={s}
+                  supportCount={supportCount}
+                  mySupportsCount={mySupportsCount}
+                  tokenBalance={tokenBalance}
+                  isOwn={isOwn}
+                  onSupport={() => handleSupport(s)}
+                  onEdit={() => {}}
+                  onDelete={() => {}}
+                />
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ─── Reply Thread ─────────────────────────────────────────────────────────────
+
+function ReplyThread({ review, bookTitle }: { review: Review; bookTitle: string }) {
+  const { user } = useAuth();
+  const [replies, setReplies] = useState<Reply[]>([]);
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+
+  useEffect(() => {
+    return onSnapshot(
+      query(collection(db, "replies"), where("reviewId", "==", review.id)),
+      (snap) => {
+        const r = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Reply));
+        r.sort((a, b) => (a.createdAt?.toMillis?.() ?? 0) - (b.createdAt?.toMillis?.() ?? 0));
+        setReplies(r);
+      }
+    );
+  }, [review.id]);
+
+  const handleSubmit = async () => {
+    if (!user || !text.trim()) return;
+    setSaving(true);
+    try {
+      await addDoc(collection(db, "replies"), {
+        reviewId: review.id,
+        bookId: review.bookId,
+        userId: user.uid,
+        userName: user.displayName ?? "Anonymous",
+        userPhoto: user.photoURL ?? "",
+        text: text.trim(),
+        createdAt: serverTimestamp(),
+      });
+      // Notify the review owner (skip if replying to own review)
+      if (review.userId !== user.uid) {
+        await addDoc(collection(db, "notifications"), {
+          recipientId: review.userId,
+          senderId: user.uid,
+          senderName: user.displayName ?? "Anonymous",
+          senderPhoto: user.photoURL ?? "",
+          type: "reply",
+          bookId: review.bookId,
+          bookTitle,
+          reviewId: review.id,
+          replyText: text.trim().slice(0, 100),
+          read: false,
+          createdAt: serverTimestamp(),
+        });
+      }
+      setText("");
+      setShowForm(false);
+      toast.success("Reply posted.");
+    } catch {
+      toast.error("Couldn't post reply.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="mt-4 pl-5 border-l-2 border-gray-100 space-y-3">
+      {replies.map((r) => (
+        <div key={r.id} className="flex gap-3 items-start">
+          <Avatar src={r.userPhoto} name={r.userName} size={6} />
+          <div className="flex-1">
+            <div className="flex items-baseline gap-2 flex-wrap">
+              <span className="font-['Lato',sans-serif] font-bold text-[#023047] text-xs">
+                {r.userName}
+              </span>
+              <span className="font-['Lato',sans-serif] text-[#023047]/30 text-[11px]">
+                {relativeTime(r.createdAt)}
+              </span>
+            </div>
+            <p className="font-['Lato',sans-serif] text-[#023047]/65 text-sm mt-0.5 leading-relaxed">
+              {r.text}
+            </p>
+          </div>
+        </div>
+      ))}
+
+      {showForm ? (
+        <div className="flex gap-3 items-start">
+          <Avatar src={user?.photoURL} name={user?.displayName} size={6} />
+          <div className="flex-1">
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Write a reply…"
+              rows={2}
+              autoFocus
+              className="w-full border border-gray-200 rounded-xl px-3 py-2 font-['Lato',sans-serif] text-sm text-[#023047] resize-none focus:outline-none focus:ring-2 focus:ring-[#219ebc]/40 placeholder:text-[#023047]/25"
+            />
+            <div className="flex gap-2 mt-2">
+              <button
+                onClick={handleSubmit}
+                disabled={saving || !text.trim()}
+                className="px-4 py-1.5 bg-[#219ebc] text-white rounded-full font-['Lato',sans-serif] text-xs font-bold hover:bg-[#1a8fa8] transition-all disabled:opacity-40"
+              >
+                {saving ? "Posting…" : "Reply"}
+              </button>
+              <button
+                onClick={() => { setShowForm(false); setText(""); }}
+                className="px-3 py-1.5 font-['Lato',sans-serif] text-xs text-[#023047]/40 hover:text-[#023047] transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setShowForm(true)}
+          className="flex items-center gap-1.5 font-['Lato',sans-serif] text-xs text-[#219ebc] hover:underline transition-colors"
+        >
+          <MessageCircle size={12} />
+          {replies.length > 0
+            ? `${replies.length} repl${replies.length === 1 ? "y" : "ies"} · Reply`
+            : "Reply"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─── Past Reads Page ──────────────────────────────────────────────────────────
+
+function PastReadsPage({ onBack }: { onBack: () => void }) {
+  const { t } = useLang();
+  const { user } = useAuth();
+  const [books, setBooks] = useState<Book[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [reviewsMap, setReviewsMap] = useState<Record<string, Review[]>>({});
+  const [finishedBookIds, setFinishedBookIds] = useState<Set<string>>(new Set());
+  const unsubRefs = useRef<Record<string, () => void>>({});
+
+  const now = new Date();
+  const cm = now.getMonth() + 1;
+  const cy = now.getFullYear();
+
+  useEffect(() => {
+    return onSnapshot(collection(db, "books"), (snap) => {
+      const past = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() } as Book))
+        .filter((b) => !b.isCurrent && (b.year < cy || (b.year === cy && b.month < cm)))
+        .sort((a, b) => b.year !== a.year ? b.year - a.year : b.month - a.month);
+      setBooks(past);
+      setLoading(false);
+    });
+  }, []);
+
+  useEffect(() => () => { Object.values(unsubRefs.current).forEach((u) => u()); }, []);
+
+  // Track which books the user has finished
+  useEffect(() => {
+    if (!user) return;
+    return onSnapshot(
+      query(collection(db, "readingStatus"), where("userId", "==", user.uid), where("status", "==", "finished")),
+      (snap) => setFinishedBookIds(new Set(snap.docs.map((d) => d.data().bookId as string)))
+    );
+  }, [user?.uid]);
+
+  const toggleExpand = (bookId: string) => {
+    if (expandedId === bookId) { setExpandedId(null); return; }
+    setExpandedId(bookId);
+    if (!unsubRefs.current[bookId]) {
+      const q = query(collection(db, "reviews"), where("bookId", "==", bookId));
+      unsubRefs.current[bookId] = onSnapshot(q, (snap) => {
+        const r = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Review));
+        r.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+        setReviewsMap((prev) => ({ ...prev, [bookId]: r }));
+      });
+    }
+  };
+
+  // Group by year-month
+  const sections: { year: number; month: number; book: Book }[] = books.map((b) => ({
+    year: b.year, month: b.month, book: b,
+  }));
+
+  const monthLabel = (m: number, y: number) =>
+    new Date(y, m - 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+
+  return (
+    <div className="min-h-screen bg-white pt-16">
+      {/* Page header */}
+      <div className="max-w-3xl mx-auto px-6 pt-14 pb-10">
+        <button
+          onClick={onBack}
+          className="font-['Lato',sans-serif] text-sm text-[#023047]/40 hover:text-[#219ebc] transition-colors mb-8 flex items-center gap-1.5"
+        >
+          <span>←</span> {t("past.back")}
+        </button>
+        <h1 className="font-['Quando',serif] text-[#023047] text-4xl mb-3">{t("past.title")}</h1>
+        <p className="font-['Lato',sans-serif] text-[#023047]/50 text-lg leading-relaxed">
+          {t("past.subtitle")}
+        </p>
+
+      </div>
+
+      {/* Timeline */}
+      <div className="max-w-3xl mx-auto px-6 pb-24">
+        {loading ? (
+          <div className="space-y-8">
+            {[1, 2].map((i) => (
+              <div key={i} className="space-y-3">
+                <Pulse className="h-5 w-36" />
+                <Pulse className="h-28 rounded-2xl" />
+              </div>
+            ))}
+          </div>
+        ) : sections.length === 0 ? (
+          <div className="text-center py-20">
+            <p className="font-['Quando',serif] text-[#023047]/40 text-xl mb-2">{t("past.empty.title")}</p>
+            <p className="font-['Lato',sans-serif] text-[#023047]/30 text-sm">
+              {t("past.empty.hint")}
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-12">
+            {sections.map(({ year, month, book }, idx) => {
+              const bookReviews = reviewsMap[book.id] ?? [];
+              const avgRating = bookReviews.length > 0
+                ? bookReviews.reduce((s, r) => s + r.rating, 0) / bookReviews.length
+                : 0;
+              const isExpanded = expandedId === book.id;
+
+              return (
+                <div key={book.id}>
+                  {/* Month separator */}
+                  {idx > 0 && <div className="h-px bg-gray-100 mb-12 -mt-0" />}
+                  <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/35 mb-5">
+                    {monthLabel(month, year)}
+                  </p>
+
+                  {/* Book card — muted, archived feel */}
+                  <div className="border border-gray-200 rounded-2xl overflow-hidden bg-white">
+                    <div className="flex gap-0">
+                      {/* Cover */}
+                      <div className="flex-shrink-0 w-28 bg-gray-100 flex items-center justify-center self-stretch overflow-hidden">
+                        {book.coverImage ? (
+                          <img
+                            src={book.coverImage}
+                            alt={`Cover of ${book.title}`}
+                            className="w-full h-full object-cover opacity-90"
+                            referrerPolicy="no-referrer"
+                            onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+                          />
+                        ) : (
+                          <BookOpen size={28} className="text-[#023047]/20" />
+                        )}
+                      </div>
+
+                      {/* Info */}
+                      <div className="flex-1 px-6 py-5">
+                        <h2 className="font-['Quando',serif] text-[#023047] text-xl leading-snug mb-1">
+                          {book.title}
+                        </h2>
+                        <p className="font-['Lato',sans-serif] text-[#023047]/50 text-sm mb-3">
+                          {book.author}
+                        </p>
+
+                        {book.description && (
+                          <p className="font-['Lato',sans-serif] text-[#023047]/45 text-sm leading-relaxed mb-4 line-clamp-2">
+                            {book.description}
+                          </p>
+                        )}
+
+                        <div className="flex items-center gap-4 flex-wrap">
+                          {avgRating > 0 && (
+                            <div className="flex items-center gap-2">
+                              <StarRating value={Math.round(avgRating)} readonly size={14} />
+                              <span className="font-['Lato',sans-serif] text-[#023047]/50 text-sm">
+                                {avgRating.toFixed(1)}
+                              </span>
+                            </div>
+                          )}
+                          <button
+                            onClick={() => toggleExpand(book.id)}
+                            className="font-['Lato',sans-serif] text-sm text-[#219ebc] hover:underline transition-colors"
+                          >
+                            {isExpanded
+                              ? t("past.hideReviews")
+                              : bookReviews.length > 0
+                              ? `${bookReviews.length} review${bookReviews.length !== 1 ? "s" : ""}`
+                              : t("past.viewReviews")}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Expanded reviews + discussion */}
+                    {isExpanded && (
+                      <div className="border-t border-gray-100 px-6 py-5 bg-gray-50/50">
+                        {reviewsMap[book.id] === undefined ? (
+                          <div className="space-y-3">
+                            <ReviewSkeleton />
+                          </div>
+                        ) : bookReviews.length === 0 ? (
+                          <p className="font-['Lato',sans-serif] text-[#023047]/35 text-sm text-center py-4">
+                            {t("past.noReviews")}
+                          </p>
+                        ) : (
+                          <div className="space-y-6">
+                            {/* Discussion gate notice */}
+                            {user && !finishedBookIds.has(book.id) && (
+                              <div className="flex items-center gap-2 px-4 py-3 bg-[#f4fafb] rounded-xl border border-[#219ebc]/15">
+                                <BookOpen size={14} className="text-[#219ebc] flex-shrink-0" />
+                                <p className="font-['Lato',sans-serif] text-[#023047]/55 text-sm">
+                                  Mark this book as finished to join the discussion.
+                                </p>
+                              </div>
+                            )}
+                            {bookReviews.map((r) => (
+                              <div key={r.id}>
+                                <ReviewCard review={r} />
+                                {user && finishedBookIds.has(book.id) && (
+                                  <ReplyThread review={r} bookTitle={book.title} />
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Closing line */}
+        {!loading && sections.length > 0 && (
+          <p className="font-['Quando',serif] text-[#023047]/25 text-sm italic text-center mt-20">
+            {t("past.closing")}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Footer ───────────────────────────────────────────────────────────────────
+
+function FooterSection({ onViewPast }: { onViewPast: () => void }) {
+  const { t } = useLang();
+  const scrollTo = (id: string) =>
+    (() => { const el = document.getElementById(id); if (!el) return; window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 40, behavior: "smooth" }); })();
+
+  return (
+    <footer id="contact" className="bg-white border-t border-gray-100">
+      <div className="max-w-4xl mx-auto px-6 pt-14 pb-10">
+
+        {/* Brand + links */}
+        <div className="mb-10">
+          <p className="font-['Quando',serif] text-[#023047] text-xl mb-4">
+            The Blue Book Club
+          </p>
           <nav aria-label="Footer navigation">
-            <ul className="flex flex-col gap-3">
+            <ul className="flex flex-wrap gap-x-6 gap-y-2">
               {[
-                { label: "This Month", id: "book" },
-                { label: "How It Works", id: "howitworks" },
+                { label: t("footer.thisMonth"), id: "book" },
+                { label: t("footer.howItWorks"), id: "howitworks" },
+                { label: t("footer.suggestions"), id: "suggestions" },
               ].map(({ label, id }) => (
                 <li key={id}>
                   <button
                     onClick={() => scrollTo(id)}
-                    className="font-['Lato',sans-serif] text-sm text-white/40 hover:text-white transition-colors focus:outline-none"
+                    className="font-['Lato',sans-serif] text-sm text-[#023047]/40 hover:text-[#219ebc] transition-colors focus:outline-none"
                   >
                     {label}
                   </button>
                 </li>
               ))}
               <li>
-                <a
-                  href="https://github.com"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-['Lato',sans-serif] text-sm text-white/40 hover:text-white transition-colors focus:outline-none"
+                <button
+                  onClick={onViewPast}
+                  className="font-['Lato',sans-serif] text-sm text-[#023047]/40 hover:text-[#219ebc] transition-colors focus:outline-none"
                 >
-                  Source Code
-                </a>
+                  {t("footer.pastReads")}
+                </button>
               </li>
             </ul>
           </nav>
         </div>
 
         {/* Divider */}
-        <div className="h-px bg-white/10 mb-8" />
+        <div className="h-px bg-gray-100 mb-8" />
 
         {/* Concept line + meta */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <p className="font-['Quando',serif] text-white/30 text-sm italic">
-            One book. One month. One community.
+          <p className="font-['Quando',serif] text-[#023047]/30 text-sm italic">
+            {t("footer.tagline")}
           </p>
-          <div className="flex flex-col md:items-end gap-1">
-            <p className="font-['Lato',sans-serif] text-white/20 text-xs">
-              Built with React · Firebase · TypeScript
-            </p>
-            <p className="font-['Lato',sans-serif] text-white/20 text-xs">
-              © 2026 The Blue Book Club
-            </p>
-          </div>
+          <a
+            href="https://github.com/Aria-vero-s"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-['Lato',sans-serif] text-[#023047]/25 text-xs hover:text-[#219ebc] transition-colors"
+          >
+            {t("footer.copyright")}
+          </a>
         </div>
 
       </div>
@@ -1504,6 +2458,26 @@ const SEED_BOOKS = [
     year: 2026,
     isCurrent: false,
   },
+  {
+    id: "book-great-gatsby",
+    title: "The Great Gatsby",
+    author: "F. Scott Fitzgerald",
+    coverImage: "https://covers.openlibrary.org/b/isbn/9780743273565-L.jpg",
+    description: "A portrait of the Jazz Age in all of its decadence and excess, told through the tragic pursuit of the American dream.",
+    month: 5,
+    year: 2026,
+    isCurrent: false,
+  },
+  {
+    id: "book-of-mice-and-men",
+    title: "Of Mice and Men",
+    author: "John Steinbeck",
+    coverImage: "https://covers.openlibrary.org/b/isbn/9780140177398-L.jpg",
+    description: "A moving story of two men chasing their dream of owning a small farm, and the friendship that sustains them.",
+    month: 4,
+    year: 2026,
+    isCurrent: false,
+  },
 ];
 
 async function seedFirestore() {
@@ -1522,11 +2496,36 @@ async function seedFirestore() {
 function AppShell() {
   const { user, loading } = useAuth();
   const [profileOpen, setProfileOpen] = useState(false);
+  const [view, setView] = useState<"home" | "past">("home");
+  const pendingScroll = useRef<string | null>(null);
 
   useEffect(() => { seedFirestore(); }, []);
 
-  const scrollTo = (id: string) =>
-    document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
+  // After returning from past view, execute any pending scroll
+  useEffect(() => {
+    if (view === "home" && pendingScroll.current) {
+      const id = pendingScroll.current;
+      pendingScroll.current = null;
+      setTimeout(() => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 40, behavior: "smooth" });
+      }, 80);
+    }
+  }, [view]);
+
+  const scrollTo = (id: string) => {
+    if (view === "past") {
+      pendingScroll.current = id;
+      setView("home");
+    } else {
+      const el = document.getElementById(id);
+      if (!el) return;
+      window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 40, behavior: "smooth" });
+    }
+  };
+
+  const goHome = () => { setView("home"); window.scrollTo({ top: 0 }); };
 
   if (loading) {
     return (
@@ -1539,29 +2538,40 @@ function AppShell() {
 
   return (
     <div className="min-h-screen bg-white">
-      <Toaster position="top-center" richColors closeButton />
+      <Toaster position="top-center" richColors closeButton toastOptions={{ classNames: { closeButton: "!left-auto !right-2 !top-1/2 !-translate-y-1/2 !translate-x-0" } }} />
       <Navbar onProfile={() => setProfileOpen(true)} onScrollTo={scrollTo} />
 
       <main>
-        <HeroSection />
-        <BookOfMonth />
-        <HowItWorksSection />
-        <VotingSection />
-        <FooterSection />
+        {view === "past" ? (
+          <>
+            <PastReadsPage onBack={goHome} />
+            <FooterSection onViewPast={() => setView("past")} />
+          </>
+        ) : (
+          <>
+            <HeroSection />
+            <BookOfMonth />
+            <HowItWorksSection />
+            <VotingSection />
+            <SuggestionsSection />
+            <FooterSection onViewPast={() => setView("past")} />
+          </>
+        )}
       </main>
 
       {profileOpen && user && (
         <UserProfileModal onClose={() => setProfileOpen(false)} />
       )}
-
     </div>
   );
 }
 
 export default function App() {
   return (
-    <AuthProvider>
-      <AppShell />
-    </AuthProvider>
+    <LanguageProvider>
+      <AuthProvider>
+        <AppShell />
+      </AuthProvider>
+    </LanguageProvider>
   );
 }
