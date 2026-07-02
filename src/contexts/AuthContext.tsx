@@ -34,10 +34,7 @@ async function ensureUserDoc(firebaseUser: User) {
       displayName: firebaseUser.displayName,
       email: firebaseUser.email,
       photoURL: firebaseUser.photoURL,
-      tokenBalance: 0,
       booksFinished: 0,
-      booksSuggested: 0,
-      supportsReceived: 0,
       createdAt: serverTimestamp(),
     });
   }
