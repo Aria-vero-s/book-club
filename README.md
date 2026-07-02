@@ -1,7 +1,7 @@
 
-  # Implement Monthly Book Club
+  # The Blue Book
 
-  This is a code bundle for Implement Monthly Book Club. The original project is available at https://www.figma.com/design/sQT6G7oOicXMyyapxHh3JE/Implement-Monthly-Book-Club.
+  live link = https://aria-vero-s.github.io/book-club/
 
   ## Running the code
 

@@ -117,11 +117,18 @@ interface Notification {
   senderId: string;
   senderName: string;
   senderPhoto: string;
-  type: "reply";
-  bookId: string;
-  bookTitle: string;
-  reviewId: string;
-  replyText: string;
+  type: "reply" | "support" | "token";
+  // reply fields
+  bookId?: string;
+  bookTitle?: string;
+  reviewId?: string;
+  replyText?: string;
+  // support fields
+  suggestionId?: string;
+  suggestionTitle?: string;
+  // token fields
+  tokenAmount?: number;
+  reason?: string;
   read: boolean;
   createdAt: Timestamp | null;
 }
@@ -130,11 +137,15 @@ interface Notification {
 
 const MAX_REVIEW = 500;
 const MAX_SUGGESTION_DESC = 200;
+const ENABLE_CLIENT_SEED = import.meta.env.VITE_ENABLE_CLIENT_SEED === "true";
 
 // Award tokens to a user — always toast silently, never block UI
-async function awardTokens(uid: string, amount: number, message: string) {
+// Pass statField to also increment a stats counter (e.g. "booksFinished")
+async function awardTokens(uid: string, amount: number, message: string, statField?: string) {
   try {
-    await updateDoc(doc(db, "users", uid), { tokenBalance: increment(amount) });
+    const data: Record<string, unknown> = { tokenBalance: increment(amount) };
+    if (statField) data[statField] = increment(1);
+    await updateDoc(doc(db, "users", uid), data);
     toast.success(message, { duration: 2500 });
   } catch { /* silent — never block the primary action */ }
 }
@@ -144,9 +155,11 @@ function useTokenBalance(uid?: string) {
   const [balance, setBalance] = useState(0);
   useEffect(() => {
     if (!uid) return;
-    return onSnapshot(doc(db, "users", uid), (snap) => {
-      setBalance(snap.data()?.tokenBalance ?? 0);
-    });
+    return onSnapshot(
+      doc(db, "users", uid),
+      (snap) => { setBalance(snap.data()?.tokenBalance ?? 0); },
+      () => { /* permission-denied expected when not signed in */ }
+    );
   }, [uid]);
   return balance;
 }
@@ -161,7 +174,8 @@ function useNotifications(uid?: string) {
         const n = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Notification));
         n.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
         setNotifications(n);
-      }
+      },
+      () => { /* permission-denied expected when not signed in */ }
     );
   }, [uid]);
   return notifications;
@@ -405,15 +419,26 @@ function NotificationBell({ uid }: { uid: string }) {
                 >
                   <Avatar src={n.senderPhoto} name={n.senderName} size={8} />
                   <div className="flex-1 min-w-0">
-                    <p className="font-['Lato',sans-serif] text-xs text-[#023047]/70 leading-relaxed">
-                      <span className="font-bold text-[#023047]">{n.senderName}</span>
-                      {" replied to your review of "}
-                      <span className="font-bold text-[#023047]">{n.bookTitle}</span>
-                    </p>
-                    {n.replyText && (
-                      <p className="font-['Lato',sans-serif] text-xs text-[#023047]/40 mt-0.5 line-clamp-1 italic">
-                        &ldquo;{n.replyText}&rdquo;
+                    {n.type === "support" ? (
+                      <p className="font-['Lato',sans-serif] text-xs text-[#023047]/70 leading-relaxed">
+                        <span className="font-bold text-[#023047]">{n.senderName}</span>
+                        {" supported your suggestion "}
+                        <span className="font-bold text-[#023047]">{n.suggestionTitle}</span>
+                        {" (+2 tokens)"}
                       </p>
+                    ) : (
+                      <>
+                        <p className="font-['Lato',sans-serif] text-xs text-[#023047]/70 leading-relaxed">
+                          <span className="font-bold text-[#023047]">{n.senderName}</span>
+                          {" replied to your review of "}
+                          <span className="font-bold text-[#023047]">{n.bookTitle}</span>
+                        </p>
+                        {n.replyText && (
+                          <p className="font-['Lato',sans-serif] text-xs text-[#023047]/40 mt-0.5 line-clamp-1 italic">
+                            &ldquo;{n.replyText}&rdquo;
+                          </p>
+                        )}
+                      </>
                     )}
                     <p className="font-['Lato',sans-serif] text-[10px] text-[#023047]/30 mt-1">
                       {relativeTime(n.createdAt)}
@@ -696,17 +721,26 @@ function ReadingStatusPicker({ bookId }: { bookId: string }) {
   const pick = async (s: "reading" | "finished") => {
     if (!user || saving) return;
     setSaving(true);
-    const wasNotFinished = status !== "finished";
+    const prevStatus = status;
     try {
       await setDoc(doc(db, "readingStatus", `${user.uid}_${bookId}`), {
         userId: user.uid,
         bookId,
         status: s,
       });
-      toast.success(s === "reading" ? t("status.toast.reading") : t("status.toast.finished"));
-      // Award token the first time a book is finished
-      if (s === "finished" && wasNotFinished) {
-        await awardTokens(user.uid, 1, t("status.toast.token"));
+      if (s === "finished" && prevStatus !== "finished") {
+        // First time finishing: +1 token, increment booksFinished
+        toast.success(t("status.toast.finished"));
+        await awardTokens(user.uid, 1, t("status.toast.token"), "booksFinished");
+      } else if (s === "reading" && prevStatus === "finished") {
+        // Reverting from finished: deduct token, decrement booksFinished
+        await updateDoc(doc(db, "users", user.uid), {
+          tokenBalance: increment(-1),
+          booksFinished: increment(-1),
+        });
+        toast.success("Reading again — 1 token removed.");
+      } else {
+        toast.success(t("status.toast.reading"));
       }
     } catch {
       toast.error(t("status.error"));
@@ -761,14 +795,27 @@ function BookOfMonth() {
   const [reviews, setReviews] = useState<Review[]>([]);
   const [statusCounts, setStatusCounts] = useState({ reading: 0, finished: 0 });
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [descExpanded, setDescExpanded] = useState(false);
+  const [userFinished, setUserFinished] = useState(false);
 
   useEffect(() => {
     const q = query(collection(db, "books"), where("isCurrent", "==", true));
-    return onSnapshot(q, (snap) => {
-      setBook(snap.empty ? null : ({ id: snap.docs[0].id, ...snap.docs[0].data() } as Book));
-      setLoading(false);
-    });
+    return onSnapshot(
+      q,
+      (snap) => {
+        setLoadFailed(false);
+        setBook(snap.empty ? null : ({ id: snap.docs[0].id, ...snap.docs[0].data() } as Book));
+        setLoading(false);
+      },
+      (err) => {
+        console.error("Failed to load current book from Firestore:", err);
+        const fallback = SEED_BOOKS.find((b) => b.isCurrent) ?? null;
+        setBook(fallback);
+        setLoadFailed(true);
+        setLoading(false);
+      }
+    );
   }, []);
 
   useEffect(() => {
@@ -789,6 +836,16 @@ function BookOfMonth() {
     });
     return () => { unsub1(); unsub2(); };
   }, [book?.id]);
+
+  // Track whether the current user has finished this book
+  useEffect(() => {
+    if (!user || !book) { setUserFinished(false); return; }
+    return onSnapshot(
+      doc(db, "readingStatus", `${user.uid}_${book.id}`),
+      (snap) => setUserFinished(snap.exists() && (snap.data()?.status as string) === "finished"),
+      () => setUserFinished(false)
+    );
+  }, [user?.uid, book?.id]);
 
   const avgRating = reviews.length > 0
     ? reviews.reduce((s, r) => s + r.rating, 0) / reviews.length
@@ -824,6 +881,13 @@ function BookOfMonth() {
           </div>
         ) : (
           <>
+            {loadFailed && (
+              <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
+                <p className="font-['Lato',sans-serif] text-sm text-amber-800">
+                  Live data could not be loaded from Firebase. Showing local fallback data.
+                </p>
+              </div>
+            )}
             {/* Main book card */}
             <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
               <div className="flex flex-col md:flex-row gap-0">
@@ -934,7 +998,7 @@ function BookOfMonth() {
 
             {/* Reviews */}
             {user && (
-              <ReviewSection bookId={book.id} bookTitle={book.title} reviews={reviews} />
+              <ReviewSection bookId={book.id} bookTitle={book.title} reviews={reviews} userFinished={userFinished} />
             )}
           </>
         )}
@@ -1141,10 +1205,12 @@ function ReviewSection({
   bookId,
   bookTitle,
   reviews,
+  userFinished = false,
 }: {
   bookId: string;
   bookTitle: string;
   reviews: Review[];
+  userFinished?: boolean;
 }) {
   const { user } = useAuth();
   const { t } = useLang();
@@ -1182,7 +1248,14 @@ function ReviewSection({
 
       {/* My review / form */}
       <div className="bg-white rounded-2xl border border-[#219ebc]/20 p-6">
-        {myReview && !editMode ? (
+        {!userFinished && !myReview ? (
+          <div className="flex items-center gap-3 py-2">
+            <BookOpen size={16} className="text-[#219ebc] flex-shrink-0" />
+            <p className="font-['Lato',sans-serif] text-[#023047]/55 text-sm">
+              Mark the book as <strong>Finished</strong> to write a review.
+            </p>
+          </div>
+        ) : myReview && !editMode ? (
           <>
             <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#219ebc] mb-4">
               {t("reviews.yourReview")}
@@ -1430,41 +1503,58 @@ function UserProfileModal({ onClose }: { onClose: () => void }) {
   const { t } = useLang();
   const [mySuggestions, setMySuggestions] = useState<Suggestion[]>([]);
   const [suggestionSupports, setSuggestionSupports] = useState<Support[]>([]);
-  const [editingSuggestion, setEditingSuggestion] = useState<Suggestion | null>(null);
-  const tokenBalance = useTokenBalance(user?.uid);
+  const [userStats, setUserStats] = useState<{ tokenBalance: number; booksFinished: number; booksSuggested: number; supportsReceived: number } | null>(null);
+  const [showForm, setShowForm] = useState(false);
+  const tokenBalance = userStats?.tokenBalance ?? 0;
 
   useEffect(() => {
     if (!user) return;
     const unsub1 = onSnapshot(
       query(collection(db, "suggestions"), where("userId", "==", user.uid)),
-      (snap) => setMySuggestions(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Suggestion)))
+      (snap) => setMySuggestions(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Suggestion))),
+      () => {}
     );
     const unsub2 = onSnapshot(
       query(collection(db, "supports"), where("suggestionOwnerId", "==", user.uid)),
-      (snap) => setSuggestionSupports(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Support)))
+      (snap) => setSuggestionSupports(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Support))),
+      () => {}
     );
-    return () => { unsub1(); unsub2(); };
+    const unsub3 = onSnapshot(doc(db, "users", user.uid), (snap) => {
+      if (snap.exists()) {
+        const d = snap.data();
+        setUserStats({
+          tokenBalance: d.tokenBalance ?? 0,
+          booksFinished: d.booksFinished ?? 0,
+          booksSuggested: d.booksSuggested ?? 0,
+          supportsReceived: d.supportsReceived ?? 0,
+        });
+      }
+    }, () => {});
+    return () => { unsub1(); unsub2(); unsub3(); };
   }, [user?.uid]);
 
-  const mySuggestion = mySuggestions[0] ?? null;
-
-  const handleDeleteSuggestion = async () => {
-    if (!mySuggestion) return;
-    await deleteDoc(doc(db, "suggestions", mySuggestion.id));
-    toast.success(t("suggest.removed"));
+  const handleDeleteSuggestion = async (suggestion: Suggestion) => {
+    if (!user) return;
+    try {
+      await deleteDoc(doc(db, "suggestions", suggestion.id));
+      toast.success(t("suggest.removed"));
+    } catch {
+      toast.error("Failed to delete suggestion.");
+    }
   };
 
   if (!user) return null;
+
+  const atLimit = mySuggestions.length >= 3;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Suggest a book"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="bg-white rounded-3xl shadow-2xl w-full h-full overflow-y-auto relative">
+      <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto relative">
 
         {/* Close button */}
         <button
@@ -1475,65 +1565,100 @@ function UserProfileModal({ onClose }: { onClose: () => void }) {
           <X size={16} />
         </button>
 
-        {/* Token rules */}
-        <div className="px-6 pt-6 pb-4 border-b border-gray-100">
-          <p className="font-['Quando',serif] text-[#023047] text-lg mb-4">
-            {t("suggest.modal.title")}
-          </p>
-          <div className="flex flex-wrap gap-3">
+        {/* Header */}
+        <div className="px-6 pt-6 pb-4 border-b border-gray-100 flex items-center gap-4">
+          <Avatar src={user.photoURL ?? ""} name={user.displayName ?? "?"} size={12} />
+          <div className="min-w-0">
+            <p className="font-['Quando',serif] text-[#023047] text-base truncate">{user.displayName}</p>
+            <p className="font-['Lato',sans-serif] text-[#023047]/40 text-xs truncate">{user.email}</p>
+          </div>
+        </div>
+
+        {/* Stats */}
+        <div className="px-6 py-4 border-b border-gray-100">
+          <div className="grid grid-cols-4 gap-3">
             {[
-              { label: t("suggest.tokenRules.finish"), value: t("suggest.tokenRules.earn"), earn: true },
-              { label: t("suggest.tokenRules.receive"), value: t("suggest.tokenRules.earn"), earn: true },
-              { label: t("suggest.tokenRules.spend"), value: t("suggest.tokenRules.cost"), earn: false },
-            ].map(({ label, value, earn }) => (
-              <div key={label} className="flex items-center gap-2 bg-gray-50 rounded-xl px-3 py-2">
-                <span className="font-['Lato',sans-serif] text-sm text-[#023047]/60">{label}</span>
-                <span className={`font-['Lato',sans-serif] text-sm font-bold flex-shrink-0 ${earn ? "text-[#219ebc]" : "text-[#023047]/45"}`}>{value}</span>
+              { label: "Tokens", value: tokenBalance, accent: true },
+              { label: "Finished", value: userStats?.booksFinished ?? 0, accent: false },
+              { label: "Suggested", value: userStats?.booksSuggested ?? 0, accent: false },
+              { label: "Supports", value: userStats?.supportsReceived ?? 0, accent: false },
+            ].map(({ label, value, accent }) => (
+              <div key={label} className="text-center bg-gray-50 rounded-2xl py-3">
+                <p className={`font-['Quando',serif] text-xl ${accent ? "text-[#219ebc]" : "text-[#023047]"}`}>{value}</p>
+                <p className="font-['Lato',sans-serif] text-[10px] text-[#023047]/40 mt-0.5">{label}</p>
               </div>
             ))}
           </div>
-          <p className="font-['Lato',sans-serif] text-[11px] text-[#023047]/35 mt-3">
-            {t("suggest.tokenRules.limit")}
-          </p>
         </div>
 
-        {/* Suggestion area */}
-        <div className="px-6 pt-5 pb-6">
-          {editingSuggestion ? (
-            <SuggestionForm
-              existing={editingSuggestion}
-              onDone={() => setEditingSuggestion(null)}
-            />
-          ) : mySuggestion ? (
-            <div className="bg-gray-50 rounded-2xl p-4 flex gap-3 items-start">
-              <div className="flex-shrink-0 w-10 h-14 rounded-lg overflow-hidden bg-gray-200 flex items-center justify-center">
-                {mySuggestion.coverImage ? (
-                  <img src={mySuggestion.coverImage} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                ) : (
-                  <BookOpen size={14} className="text-[#219ebc]/40" />
-                )}
+        {/* Token rules */}
+        <div className="px-6 py-4 border-b border-gray-100">
+          <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/30 mb-3">Token rules</p>
+          <div className="flex flex-wrap gap-2">
+            {[
+              { label: t("suggest.tokenRules.finish"), earn: true },
+              { label: t("suggest.tokenRules.receive"), earn: true },
+              { label: t("suggest.tokenRules.spend"), earn: false },
+            ].map(({ label, earn }) => (
+              <div key={label} className="flex items-center gap-1.5 bg-gray-50 rounded-xl px-3 py-1.5">
+                <span className={`font-['Lato',sans-serif] text-xs font-bold ${earn ? "text-[#219ebc]" : "text-[#023047]/40"}`}>{earn ? "+" : "−"}1</span>
+                <span className="font-['Lato',sans-serif] text-xs text-[#023047]/55">{label}</span>
               </div>
-              <div className="flex-1 min-w-0">
-                <p className="font-['Quando',serif] text-[#023047] text-sm truncate">{mySuggestion.title}</p>
-                <p className="font-['Lato',sans-serif] text-[#023047]/45 text-sm">{mySuggestion.author}</p>
-                <div className="flex items-center gap-1 mt-1.5">
-                  <ThumbsUp size={11} className="text-[#219ebc]" />
-                  <span className="font-['Lato',sans-serif] text-sm text-[#023047]/50">
-                    {suggestionSupports.filter((x) => x.suggestionId === mySuggestion.id).length} {t("picks.supports")}
-                  </span>
+            ))}
+          </div>
+        </div>
+
+        {/* My suggestions */}
+        <div className="px-6 pt-4 pb-6 space-y-3">
+          <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/30">My Suggestions ({mySuggestions.length}/3)</p>
+
+          {mySuggestions.map((s) => {
+            const supportCount = suggestionSupports.filter((x) => x.suggestionId === s.id).length;
+            return (
+              <div key={s.id} className="bg-gray-50 rounded-2xl p-4 flex gap-3 items-start">
+                <div className="flex-shrink-0 w-10 h-14 rounded-lg overflow-hidden bg-gray-200 flex items-center justify-center">
+                  {s.coverImage ? (
+                    <img src={s.coverImage} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  ) : (
+                    <BookOpen size={14} className="text-[#219ebc]/40" />
+                  )}
                 </div>
-              </div>
-              <div className="flex gap-1">
-                <button onClick={() => setEditingSuggestion(mySuggestion)} className="p-1.5 rounded-full text-[#023047]/30 hover:text-[#219ebc] hover:bg-[#219ebc]/8 transition-all" aria-label="Edit">
-                  <Edit2 size={12} />
-                </button>
-                <button onClick={handleDeleteSuggestion} className="p-1.5 rounded-full text-[#023047]/30 hover:text-red-400 hover:bg-red-50 transition-all" aria-label="Delete">
+                <div className="flex-1 min-w-0">
+                  <p className="font-['Quando',serif] text-[#023047] text-sm truncate">{s.title}</p>
+                  <p className="font-['Lato',sans-serif] text-[#023047]/45 text-sm">{s.author}</p>
+                  <div className="flex items-center gap-1 mt-1.5">
+                    <ThumbsUp size={11} className="text-[#219ebc]" />
+                    <span className="font-['Lato',sans-serif] text-xs text-[#023047]/50">{supportCount} {t("picks.supports")}</span>
+                  </div>
+                </div>
+                <button onClick={() => handleDeleteSuggestion(s)} className="p-1.5 rounded-full text-[#023047]/30 hover:text-red-400 hover:bg-red-50 transition-all flex-shrink-0" aria-label="Delete">
                   <Trash2 size={12} />
                 </button>
               </div>
-            </div>
-          ) : (
-            <SuggestionForm onDone={onClose} />
+            );
+          })}
+
+          {!atLimit && !showForm && (
+            <button
+              onClick={() => setShowForm(true)}
+              className="w-full py-3 border-2 border-dashed border-[#219ebc]/30 rounded-2xl font-['Lato',sans-serif] text-sm text-[#023047]/40 hover:border-[#219ebc]/50 hover:text-[#219ebc] transition-all"
+            >
+              + Add a suggestion ({3 - mySuggestions.length} slot{3 - mySuggestions.length !== 1 ? "s" : ""} left)
+            </button>
+          )}
+
+          {showForm && (
+            <SuggestionForm
+              onDone={() => setShowForm(false)}
+              tokenBalance={tokenBalance}
+              existingCount={mySuggestions.length}
+            />
+          )}
+
+          {atLimit && !showForm && (
+            <p className="font-['Lato',sans-serif] text-xs text-[#023047]/40 text-center py-2">
+              Maximum 3 suggestions reached.
+            </p>
           )}
         </div>
       </div>
@@ -1666,28 +1791,32 @@ function HowItWorksSection() {
 // ─── Suggestions ─────────────────────────────────────────────────────────────
 
 function SuggestionForm({
-  existing,
   onDone,
+  tokenBalance,
+  existingCount,
 }: {
-  existing?: Suggestion;
   onDone: () => void;
+  tokenBalance: number;
+  existingCount: number;
 }) {
   const { user } = useAuth();
   const { t } = useLang();
-  const [title, setTitle] = useState(existing?.title ?? "");
-  const [author, setAuthor] = useState(existing?.author ?? "");
-  const [coverImage, setCoverImage] = useState(existing?.coverImage ?? "");
-  const [description, setDescription] = useState(existing?.description ?? "");
+  const [title, setTitle] = useState("");
+  const [author, setAuthor] = useState("");
+  const [coverImage, setCoverImage] = useState("");
+  const [description, setDescription] = useState("");
   const [saving, setSaving] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
-  const handleSubmit = async () => {
-    if (!user || !title.trim() || !author.trim()) {
-      toast.error(t("suggest.form.required"));
-      return;
-    }
+  const atLimit = existingCount >= 3;
+  const noTokens = tokenBalance < 1;
+
+  const handleConfirm = async () => {
+    if (!user || saving || atLimit || noTokens) return;
     setSaving(true);
+    setConfirming(false);
     try {
-      const payload = {
+      await addDoc(collection(db, "suggestions"), {
         userId: user.uid,
         userName: user.displayName ?? "Anonymous",
         userPhoto: user.photoURL ?? "",
@@ -1696,14 +1825,12 @@ function SuggestionForm({
         coverImage: coverImage.trim(),
         description: description.trim().slice(0, MAX_SUGGESTION_DESC),
         createdAt: serverTimestamp(),
-      };
-      if (existing) {
-        await updateDoc(doc(db, "suggestions", existing.id), payload);
-        toast.success(t("suggest.updated"));
-      } else {
-        await addDoc(collection(db, "suggestions"), payload);
-        toast.success(t("suggest.added"));
-      }
+      });
+      await updateDoc(doc(db, "users", user.uid), {
+        tokenBalance: increment(-1),
+        booksSuggested: increment(1),
+      });
+      toast.success(`${t("suggest.added")} \u22121 Token.`);
       onDone();
     } catch {
       toast.error(t("suggest.error"));
@@ -1712,13 +1839,69 @@ function SuggestionForm({
     }
   };
 
+  if (noTokens) {
+    return (
+      <div className="flex items-start gap-3 p-4 bg-amber-50 rounded-2xl border border-amber-200">
+        <Sparkles size={16} className="text-amber-500 flex-shrink-0 mt-0.5" />
+        <p className="font-['Lato',sans-serif] text-sm text-amber-800">
+          Not enough tokens. First, mark the Book of the Month as <strong>Finished</strong> or support another book, then come back.
+        </p>
+      </div>
+    );
+  }
+
+  if (atLimit) {
+    return (
+      <div className="flex items-start gap-3 p-4 bg-gray-50 rounded-2xl border border-gray-200">
+        <BookOpen size={16} className="text-[#023047]/40 flex-shrink-0 mt-0.5" />
+        <p className="font-['Lato',sans-serif] text-sm text-[#023047]/60">
+          You&apos;ve reached the limit of <strong>3 active suggestions</strong>. Delete one to add a new suggestion.
+        </p>
+      </div>
+    );
+  }
+
+  if (confirming) {
+    return (
+      <div className="bg-white rounded-2xl border border-[#219ebc]/20 p-6 space-y-4">
+        <div className="p-4 bg-[#f4fafb] rounded-2xl border border-[#219ebc]/15">
+          <p className="font-['Lato',sans-serif] text-sm font-bold text-[#023047]">{title}</p>
+          <p className="font-['Lato',sans-serif] text-sm text-[#023047]/50">{author}</p>
+          {description && <p className="font-['Lato',sans-serif] text-sm text-[#023047]/45 mt-1 leading-relaxed">{description}</p>}
+        </div>
+        <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl">
+          <p className="font-['Lato',sans-serif] text-sm font-bold text-amber-800 mb-1">Are you sure the information is correct?</p>
+          <p className="font-['Lato',sans-serif] text-xs text-amber-700">You won&apos;t be able to come back and edit this. This will cost 1 token.</p>
+        </div>
+        <div className="flex gap-3">
+          <button
+            onClick={handleConfirm}
+            disabled={saving}
+            className="px-6 py-2.5 bg-[#219ebc] text-white rounded-full font-['Lato',sans-serif] text-sm font-bold hover:bg-[#1a8fa8] transition-all active:scale-95 disabled:opacity-40"
+          >
+            {saving ? t("suggest.form.saving") : "Yes, submit"}
+          </button>
+          <button
+            onClick={() => setConfirming(false)}
+            className="px-4 py-2.5 rounded-full font-['Lato',sans-serif] text-sm text-[#023047]/50 hover:text-[#023047] hover:bg-gray-100 transition-all"
+          >
+            Go back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="bg-white rounded-2xl border border-[#219ebc]/20 p-6 space-y-4">
-      {existing && (
-        <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40 mb-1">
-          {t("suggest.form.edit")}
+      <div className="flex items-center justify-between mb-1">
+        <p className="font-['Lato',sans-serif] text-xs font-bold uppercase tracking-widest text-[#023047]/40">
+          New suggestion
         </p>
-      )}
+        <span className="font-['Lato',sans-serif] text-xs text-[#023047]/40">
+          {existingCount}/3 used · costs 1 token
+        </span>
+      </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
           <label className="block font-['Lato',sans-serif] text-xs font-bold text-[#023047]/50 mb-1.5">
@@ -1775,11 +1958,14 @@ function SuggestionForm({
       </div>
       <div className="flex items-center gap-3">
         <button
-          onClick={handleSubmit}
+          onClick={() => {
+            if (!title.trim() || !author.trim()) { toast.error(t("suggest.form.required")); return; }
+            setConfirming(true);
+          }}
           disabled={saving || !title.trim() || !author.trim()}
           className="px-6 py-2.5 bg-[#219ebc] text-white rounded-full font-['Lato',sans-serif] text-sm font-bold hover:bg-[#1a8fa8] transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          {saving ? t("suggest.form.saving") : existing ? t("suggest.form.update") : t("suggest.form.submit")}
+          {t("suggest.form.submit")}
         </button>
         <button
           onClick={onDone}
@@ -1795,20 +1981,18 @@ function SuggestionForm({
 function SuggestionCard({
   suggestion,
   supportCount,
-  mySupportsCount,
+  isSupported,
   tokenBalance,
   isOwn,
   onSupport,
-  onEdit,
   onDelete,
 }: {
   suggestion: Suggestion;
   supportCount: number;
-  mySupportsCount: number;
+  isSupported: boolean;
   tokenBalance: number;
   isOwn: boolean;
   onSupport: () => void;
-  onEdit: () => void;
   onDelete: () => void;
 }) {
   const { t } = useLang();
@@ -1843,13 +2027,6 @@ function SuggestionCard({
           </div>
           {isOwn && (
             <div className="flex gap-1 flex-shrink-0">
-              <button
-                onClick={onEdit}
-                aria-label="Edit suggestion"
-                className="p-1.5 rounded-full text-[#023047]/30 hover:text-[#219ebc] hover:bg-[#219ebc]/8 transition-all"
-              >
-                <Edit2 size={13} />
-              </button>
               <button
                 onClick={onDelete}
                 aria-label="Delete suggestion"
@@ -1887,16 +2064,18 @@ function SuggestionCard({
             {!isOwn && (
               <button
                 onClick={onSupport}
-                disabled={tokenBalance < 1}
-                title={tokenBalance < 1 ? "You need tokens to support — finish a book or write a review to earn them" : `Support with 1 token${mySupportsCount > 0 ? ` (you've supported ${mySupportsCount}×)` : ""}`}
+                disabled={!isSupported && tokenBalance < 1}
+                title={isSupported ? "Remove support (+1 token refund)" : tokenBalance < 1 ? "You need tokens to support" : "Support with 1 token"}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full font-['Lato',sans-serif] text-xs font-bold transition-all ${
-                  tokenBalance < 1
+                  isSupported
+                    ? "bg-[#219ebc]/15 text-[#219ebc] hover:bg-red-50 hover:text-red-500 active:scale-95"
+                    : tokenBalance < 1
                     ? "bg-gray-100 text-[#023047]/30 cursor-not-allowed"
                     : "bg-[#ffb703]/15 text-[#023047] hover:bg-[#ffb703]/30 active:scale-95"
                 }`}
               >
-                <Sparkles size={11} className={tokenBalance < 1 ? "text-[#023047]/25" : "text-[#ffb703]"} />
-                {t("picks.support")}{mySupportsCount > 0 ? ` ×${mySupportsCount + 1}` : ""}
+                <Sparkles size={11} className={isSupported ? "text-[#219ebc]" : tokenBalance < 1 ? "text-[#023047]/25" : "text-[#ffb703]"} />
+                {isSupported ? "Remove" : t("picks.support")}
               </button>
             )}
           </div>
@@ -1917,13 +2096,13 @@ function SuggestionsSection() {
   useEffect(() => {
     return onSnapshot(collection(db, "suggestions"), (snap) => {
       setSuggestions(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Suggestion)));
-    });
+    }, () => {});
   }, []);
 
   useEffect(() => {
     return onSnapshot(collection(db, "supports"), (snap) => {
       setSupports(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Support)));
-    });
+    }, () => {});
   }, []);
 
   const sorted = [...suggestions].sort((a, b) => {
@@ -1932,19 +2111,52 @@ function SuggestionsSection() {
     return bS - aS;
   });
 
+  const handleDeleteSuggestion = async (suggestion: Suggestion) => {
+    if (!user || suggestion.userId !== user.uid) return;
+    try {
+      await deleteDoc(doc(db, "suggestions", suggestion.id));
+      toast.success("Suggestion deleted.");
+    } catch {
+      toast.error("Failed to delete suggestion.");
+    }
+  };
+
   const handleSupport = async (suggestion: Suggestion) => {
-    if (!user || tokenBalance < 1 || supporting) return;
+    if (!user || supporting) return;
+    const existingSupport = supports.find((s) => s.suggestionId === suggestion.id && s.userId === user.uid);
+    const isCurrentlySupported = !!existingSupport;
     setSupporting(suggestion.id);
     try {
-      await updateDoc(doc(db, "users", user.uid), { tokenBalance: increment(-1) });
-      await addDoc(collection(db, "supports"), {
-        userId: user.uid,
-        suggestionId: suggestion.id,
-        suggestionOwnerId: suggestion.userId,
-        createdAt: serverTimestamp(),
-      });
-      await updateDoc(doc(db, "users", suggestion.userId), { tokenBalance: increment(2) });
-      toast.success(t("picks.supportToast"), { duration: 2500 });
+      if (isCurrentlySupported) {
+        await deleteDoc(doc(db, "supports", existingSupport.id));
+        await updateDoc(doc(db, "users", user.uid), { tokenBalance: increment(1) });
+        await updateDoc(doc(db, "users", suggestion.userId), { tokenBalance: increment(-2), supportsReceived: increment(-1) });
+        toast.success("+1 Token refunded — support removed.");
+      } else {
+        if (tokenBalance < 1) { toast.error("Not enough tokens to support."); return; }
+        await addDoc(collection(db, "supports"), {
+          userId: user.uid,
+          suggestionId: suggestion.id,
+          suggestionOwnerId: suggestion.userId,
+          createdAt: serverTimestamp(),
+        });
+        await updateDoc(doc(db, "users", user.uid), { tokenBalance: increment(-1) });
+        await updateDoc(doc(db, "users", suggestion.userId), { tokenBalance: increment(2), supportsReceived: increment(1) });
+        if (suggestion.userId !== user.uid) {
+          await addDoc(collection(db, "notifications"), {
+            recipientId: suggestion.userId,
+            senderId: user.uid,
+            senderName: user.displayName ?? "Anonymous",
+            senderPhoto: user.photoURL ?? "",
+            type: "support",
+            suggestionId: suggestion.id,
+            suggestionTitle: suggestion.title,
+            read: false,
+            createdAt: serverTimestamp(),
+          });
+        }
+        toast.success(t("picks.supportToast"), { duration: 2500 });
+      }
     } catch {
       toast.error(t("picks.supportError"));
     } finally {
@@ -1982,18 +2194,17 @@ function SuggestionsSection() {
             {sorted.map((s) => {
               const isOwn = s.userId === user?.uid;
               const supportCount = supports.filter((x) => x.suggestionId === s.id).length;
-              const mySupportsCount = supports.filter((x) => x.suggestionId === s.id && x.userId === user?.uid).length;
+              const isSupported = supports.some((x) => x.suggestionId === s.id && x.userId === user?.uid);
               return (
                 <SuggestionCard
                   key={s.id}
                   suggestion={s}
                   supportCount={supportCount}
-                  mySupportsCount={mySupportsCount}
+                  isSupported={isSupported}
                   tokenBalance={tokenBalance}
                   isOwn={isOwn}
                   onSupport={() => handleSupport(s)}
-                  onEdit={() => {}}
-                  onDelete={() => {}}
+                  onDelete={() => handleDeleteSuggestion(s)}
                 />
               );
             })}
@@ -2347,6 +2558,19 @@ function PastReadsPage({ onBack }: { onBack: () => void }) {
   );
 }
 
+// ─── Meetup Banner ───────────────────────────────────────────────────────────
+
+function MeetupBanner() {
+  return (
+    <div className="bg-[#023047] text-white">
+      <div className="max-w-4xl mx-auto px-5 py-3 flex items-center justify-center gap-2 flex-wrap text-center">
+        <span className="font-['Lato',sans-serif] text-sm text-white/70">📅 The meetup is automatically set to:</span>
+        <span className="font-['Lato',sans-serif] text-sm font-bold text-white">Last Sunday of the month at 19:00 · École 42 Paris</span>
+      </div>
+    </div>
+  );
+}
+
 // ─── Footer ───────────────────────────────────────────────────────────────────
 
 function FooterSection({ onViewPast }: { onViewPast: () => void }) {
@@ -2481,13 +2705,18 @@ const SEED_BOOKS = [
 ];
 
 async function seedFirestore() {
-  for (const book of SEED_BOOKS) {
-    const ref = doc(db, "books", book.id);
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
-      const { id, ...data } = book;
-      await setDoc(ref, data);
+  try {
+    for (const book of SEED_BOOKS) {
+      const ref = doc(db, "books", book.id);
+      const snap = await getDoc(ref);
+      if (!snap.exists()) {
+        const { id, ...data } = book;
+        await setDoc(ref, data);
+      }
     }
+  } catch (err) {
+    // Client-side seeds are optional and usually blocked in production rules.
+    console.warn("Skipping client seed:", err);
   }
 }
 
@@ -2499,7 +2728,10 @@ function AppShell() {
   const [view, setView] = useState<"home" | "past">("home");
   const pendingScroll = useRef<string | null>(null);
 
-  useEffect(() => { seedFirestore(); }, []);
+  useEffect(() => {
+    if (!ENABLE_CLIENT_SEED) return;
+    seedFirestore();
+  }, []);
 
   // After returning from past view, execute any pending scroll
   useEffect(() => {
@@ -2550,6 +2782,7 @@ function AppShell() {
         ) : (
           <>
             <HeroSection />
+            <MeetupBanner />
             <BookOfMonth />
             <HowItWorksSection />
             <VotingSection />

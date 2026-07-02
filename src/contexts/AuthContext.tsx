@@ -4,16 +4,15 @@ import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore";
 import { auth, googleProvider, db } from "@/lib/firebase";
 
 // ─── Mock mode ────────────────────────────────────────────────────────────────
-// Set to true to bypass Google Auth during development.
-// All Firestore writes will use the mock user ID below.
-// Flip to false to re-enable real authentication.
-const MOCK_AUTH = true;
+// Set VITE_MOCK_AUTH=true in .env to bypass Google Auth during development.
+// Must be false for real Firebase reads/writes to work correctly.
+const MOCK_AUTH = import.meta.env.VITE_MOCK_AUTH === "true";
 
 const MOCK_USER = {
-  uid: "mock-user-1",
-  displayName: "Test User",
-  email: "test@bookclub.dev",
-  photoURL: "https://i.pravatar.cc/150",
+  uid: "mock-user-dev",
+  displayName: "Dev User",
+  email: "dev@bookclub.dev",
+  photoURL: "https://i.pravatar.cc/150?u=dev",
 } as unknown as User;
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -35,6 +34,10 @@ async function ensureUserDoc(firebaseUser: User) {
       displayName: firebaseUser.displayName,
       email: firebaseUser.email,
       photoURL: firebaseUser.photoURL,
+      tokenBalance: 0,
+      booksFinished: 0,
+      booksSuggested: 0,
+      supportsReceived: 0,
       createdAt: serverTimestamp(),
     });
   }
