@@ -1323,12 +1323,16 @@ function VotingSection() {
   }, []);
 
   useEffect(() => {
-    return onSnapshot(collection(db, "votes"), (snap) => {
-      const v = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Vote));
-      setVotes(v);
-      if (user) setMyVote(v.find((x) => x.userId === user.uid)?.bookId ?? null);
-      setLoadingVotes(false);
-    });
+    return onSnapshot(
+      collection(db, "votes"),
+      (snap) => {
+        const v = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Vote));
+        setVotes(v);
+        if (user) setMyVote(v.find((x) => x.userId === user.uid)?.bookId ?? null);
+        setLoadingVotes(false);
+      },
+      (err) => { console.error("[Votes listener error]", err); setLoadingVotes(false); }
+    );
   }, [user?.uid]);
 
   const handleVote = async (bookId: string) => {
@@ -1348,7 +1352,8 @@ function VotingSection() {
         });
         toast.success(myVote ? t("vote.updated") : t("vote.cast"));
       }
-    } catch {
+    } catch (err) {
+      console.error("[Vote error]", err);
       toast.error(t("vote.error"));
     } finally {
       setSaving(false);

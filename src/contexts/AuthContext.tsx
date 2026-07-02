@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { User, onAuthStateChanged, signInWithRedirect, getRedirectResult, signOut } from "firebase/auth";
+import { User, onAuthStateChanged, signInWithPopup, signOut } from "firebase/auth";
 import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore";
 import { auth, googleProvider, db } from "@/lib/firebase";
 
@@ -50,12 +50,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (MOCK_AUTH) return;
 
-    getRedirectResult(auth)
-      .then(async (result) => {
-        if (result?.user) await ensureUserDoc(result.user);
-      })
-      .catch((err) => console.error("Redirect sign-in error:", err));
-
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) await ensureUserDoc(firebaseUser);
       setUser(firebaseUser);
@@ -66,7 +60,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signIn = async () => {
     if (MOCK_AUTH) return;
-    await signInWithRedirect(auth, googleProvider);
+    const result = await signInWithPopup(auth, googleProvider);
+    await ensureUserDoc(result.user);
   };
 
   const logOut = async () => {
